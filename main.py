@@ -1,0 +1,9334 @@
+import sys
+import os
+
+# 1 linha para explicar o motivo: Adiciona o diretório do script ao path para evitar erros de importação ao rodar fora do Cwd.
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
+import customtkinter as ctk
+from customtkinter import CTkButton
+from tkinter import messagebox, filedialog, ttk
+import database
+import ai_module
+import invoice_generator
+from PIL import Image, ImageTk
+import os
+import shutil
+import datetime
+import sys
+import logging
+import ctypes
+import subprocess
+import pandas as pd
+from notifications import NotificationManager
+import label_generator
+# Importação opcional para barcode_scanner (pode falhar em alguns ambientes)
+try:
+    import barcode_scanner
+    BARCODE_SCANNER_AVAILABLE = True
+except ImportError:
+    BARCODE_SCANNER_AVAILABLE = False
+    logger_temp = None
+import api_server
+
+# --- Ícone na barra de tarefas do Windows ---
+# Define um AppUserModelID para que o Windows exiba o ícone do app
+# em vez do ícone padrão do Python na barra de tarefas.
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('EstokeAoCubo.App.2.3')
+except Exception:
+    pass
+
+# configuração e impressão
+import config
+from config import get_printer_config, set_printer_config, get_business_type, set_business_type, verify_admin, get_admin_credentials, set_admin_credentials
+from printer import get_printer
+import json
+
+# --- Configuração de Logging ---
+_log_dir = os.path.join(os.getenv('LOCALAPPDATA', os.path.expanduser('~')), 'EstokeAoCubo')
+os.makedirs(_log_dir, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(_log_dir, 'app.log'), encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('EstokeAoCubo')
+
+# --- Monkeypatch para corrigir bug do CTkButton.destroy ---
+# O erro ocorre porque _font às vezes não existe quando destroy é chamado.
+_original_destroy = CTkButton.destroy
+
+def _safe_destroy(self):
+    if not hasattr(self, '_font'):
+        self._font = None
+    try:
+        _original_destroy(self)
+    except (AttributeError, TypeError, Exception):
+        # Se falhar mesmo assim (ex: widget já destruído), ignorar
+        pass
+
+CTkButton.destroy = _safe_destroy
+# ----------------------------------------------------------
+
+def get_base_path():
+    """Retorna o caminho base da aplicação (compatível com PyInstaller)."""
+    if getattr(sys, 'frozen', False):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+ctk.set_appearance_mode("Light")  # Modes: "System" (standard), "Dark", "Light"
+ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Estoke ao Cubo - Gestão Inteligente")
+        self.geometry("1100x950")
+        self.minsize(800, 500)
+        self.configure(fg_color=("#F0F0F5", "#191919")) # Fundo levemente lavanda/cinza para contraste com botões glass
+
+        # Adicionar ícone da aplicação (titlebar + taskbar)
+        self._icon_path_ico = None
+        try:
+            base_path = get_base_path()
+            icon_path_ico = os.path.join(base_path, "icon", "icon-cubo.ico")
+            icon_path_png = os.path.join(base_path, "icon", "icon-cubo.png")
+
+            if os.path.exists(icon_path_ico):
+                self._icon_path_ico = icon_path_ico
+                # Aplica o ícone como padrão para todas as janelas
+                self.iconbitmap(default=icon_path_ico)
+                self.iconbitmap(icon_path_ico)
+                # Reaplica múltiplas vezes — customtkinter pode resetar
+                self.after(100, self._forcar_icone)
+                self.after(500, self._forcar_icone)
+                self.after(1500, self._forcar_icone)
+            elif os.path.exists(icon_path_png):
+                icon_image = Image.open(icon_path_png)
+                icon_image = icon_image.resize((128, 128), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(icon_image)
+                self.iconphoto(False, photo)
+                self._icon_photo = photo  # manter referência
+        except Exception as e:
+            logger.warning("Erro ao carregar ícone: %s", e)
+
+        # Configuração do Grid
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=0)  # Topbar não expande
+        self.grid_rowconfigure(1, weight=1)  # Main frame expande
+
+        # Tela cheia (F11 / Esc)
+        self._fullscreen = False
+        self.bind_all("<F11>", self._toggle_fullscreen)
+        self.bind_all("<Escape>", self._exit_fullscreen)
+
+        # Inicializar Banco de Dados e IA
+        self.db = database.Database()
+        self.ai = ai_module.ExpensePredictor(self.db)
+
+        # Inicializar camada de anotações
+        from services.dreams_service import SonhosService
+        self.sonhos_service = SonhosService(self.db.conn)
+
+        # Sessão do usuário logado (None = sem login multi-usuário)
+        self.current_user = None
+
+        # Gerenciador de notificações toast
+        self.notifier = NotificationManager(self)
+
+        # API REST para app mobile
+        self.api_server = None
+
+        # Singleton tracking para diálogos críticos
+        self._pdv_dialog = None
+
+        # Verificar tipo de negócio (primeiro acesso)
+        self.business_type = get_business_type()
+        
+        if self.business_type is None:
+            self._show_first_access_screen()
+        else:
+            self._show_login_screen()
+
+    def _get_os_config(self):
+        """Retorna status, cores, ícones e rótulos de OS adaptados ao tipo de negócio."""
+        bt = getattr(self, 'business_type', None) or 'variados'
+        if bt == "restaurante":
+            statuses = ["Recebido", "Preparando", "Pronto", "Entregue", "Concluído"]
+            colors = {"Recebido": "#3498DB", "Preparando": "#F39C12", "Pronto": "#27AE60",
+                      "Entregue": "#2ECC71", "Concluído": "#28a745"}
+            icons = {"Recebido": "📥", "Preparando": "🍳", "Pronto": "✅",
+                     "Entregue": "🍽️", "Concluído": "🏁"}
+            title = "🍽️ PEDIDOS"
+            equip_label = "Prato / Pedido:"
+            equip_placeholder = "Ex: X-Burguer, Pizza Calabresa, Combo 1..."
+        elif bt == "padaria_acougue":
+            statuses = ["Recebido", "Em Preparo", "Pronto p/ Retirada", "Entregue", "Concluído"]
+            colors = {"Recebido": "#3498DB", "Em Preparo": "#F39C12", "Pronto p/ Retirada": "#27AE60",
+                      "Entregue": "#2ECC71", "Concluído": "#28a745"}
+            icons = {"Recebido": "📥", "Em Preparo": "🥩", "Pronto p/ Retirada": "✅",
+                     "Entregue": "📦", "Concluído": "🏁"}
+            title = "🥩 ENCOMENDAS"
+            equip_label = "Produto / Encomenda:"
+            equip_placeholder = "Ex: Bolo de Aniversário, 5kg Picanha, Pão Encomenda..."
+        elif bt == "loja_roupa":
+            statuses = ["Recebido", "Em Ajuste", "Pronto p/ Retirada", "Entregue", "Concluído"]
+            colors = {"Recebido": "#3498DB", "Em Ajuste": "#9B59B6", "Pronto p/ Retirada": "#27AE60",
+                      "Entregue": "#2ECC71", "Concluído": "#28a745"}
+            icons = {"Recebido": "📥", "Em Ajuste": "✂️", "Pronto p/ Retirada": "✅",
+                     "Entregue": "👗", "Concluído": "🏁"}
+            title = "✂️ AJUSTES / COSTURAS"
+            equip_label = "Peça / Item:"
+            equip_placeholder = "Ex: Vestido Longo, Calça Jeans (barra), Terno..."
+        elif bt == "artesanato":
+            statuses = ["Recebido", "Em Produção", "Acabamento", "Pronto", "Entregue", "Concluído"]
+            colors = {"Recebido": "#3498DB", "Em Produção": "#F39C12", "Acabamento": "#9B59B6",
+                      "Pronto": "#27AE60", "Entregue": "#2ECC71", "Concluído": "#28a745"}
+            icons = {"Recebido": "📥", "Em Produção": "🎨", "Acabamento": "✨",
+                     "Pronto": "✅", "Entregue": "📦", "Concluído": "🏁"}
+            title = "🎨 ENCOMENDAS"
+            equip_label = "Peça / Encomenda:"
+            equip_placeholder = "Ex: Quadro Personalizado, Vaso Cerâmica, Kit Presente..."
+        else:  # variados / assistência técnica
+            statuses = ["Recebido", "Em Análise", "Aguardando Peça", "Em Execução", "Pronto", "Entregue", "Concluído"]
+            colors = {"Recebido": "#3498DB", "Em Análise": "#F39C12", "Aguardando Peça": "#E67E22",
+                      "Em Execução": "#9B59B6", "Pronto": "#27AE60", "Entregue": "#2ECC71", "Concluído": "#28a745"}
+            icons = {"Recebido": "📥", "Em Análise": "🔍", "Aguardando Peça": "⏳",
+                     "Em Execução": "🔧", "Pronto": "✅", "Entregue": "📦", "Concluído": "🏁"}
+            title = "🔧 SERVIÇOS (OS)"
+            equip_label = "Equipamento / Item:"
+            equip_placeholder = "Ex: iPhone 14, Notebook Dell, Motor X..."
+        return {
+            "statuses": statuses, "colors": colors, "icons": icons,
+            "title": title, "equip_label": equip_label, "equip_placeholder": equip_placeholder,
+        }
+
+    def _show_first_access_screen(self):
+        """Tela de primeiro acesso — escolha do tipo de negócio."""
+        self._setup_frame = ctk.CTkFrame(self, fg_color=("#F0F0F5", "#191919"))
+        self._setup_frame.grid(row=0, column=0, rowspan=4, columnspan=2, sticky="nsew")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        inner = ctk.CTkFrame(self._setup_frame, fg_color="transparent")
+        inner.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Logo
+        try:
+            base_path = get_base_path()
+            icon_path = os.path.join(base_path, "icon", "icon-cubo.png")
+            if os.path.exists(icon_path):
+                pil_img = Image.open(icon_path)
+                self._setup_logo = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(100, 100))
+                ctk.CTkLabel(inner, image=self._setup_logo, text="").pack(pady=(0, 10))
+        except Exception:
+            pass
+
+        ctk.CTkLabel(inner, text="Bem-vindo ao Estoke ao Cubo!",
+                     font=("Aileron", 24, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 5))
+        ctk.CTkLabel(inner, text="Selecione o tipo do seu negócio para personalizar a experiência:",
+                     font=("Aileron", 13), text_color=("gray40", "gray70")).pack(pady=(0, 25))
+
+        # Grid de cards
+        cards_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        cards_frame.pack()
+
+        business_options = [
+            {"key": "artesanato", "title": "Artesanato", "icon": "🎨",
+             "desc": "Produtos feitos à mão,\ncálculo de horas e materiais", "color": "#E8A87C"},
+            {"key": "padaria_acougue", "title": "Padaria / Açougue", "icon": "🥖",
+             "desc": "Venda por peso (kg/g),\nprodutos perecíveis", "color": "#D4A373"},
+            {"key": "loja_roupa", "title": "Loja de Roupas", "icon": "👗",
+             "desc": "Tamanhos P/M/G/GG,\nsapatos e calças", "color": "#7BBDE8"},
+            {"key": "restaurante", "title": "Restaurante", "icon": "🍽️",
+             "desc": "Mesas, comandas,\ncozinha e delivery", "color": "#E07B56"},
+            {"key": "variados", "title": "Variados", "icon": "🏪",
+             "desc": "Loja geral, conveniência,\nprodutos diversos", "color": "#85C1E9"},
+        ]
+
+        select_buttons = []
+
+        def _select_business(btype):
+            set_business_type(btype)
+            self.business_type = btype
+            self._setup_frame.destroy()
+            self._show_login_screen()
+
+        for i, opt in enumerate(business_options):
+            card = ctk.CTkFrame(cards_frame, width=200, height=200, fg_color=("white", "#2B2B2B"),
+                               corner_radius=15, border_width=2, border_color=(opt["color"], opt["color"]))
+            card.grid(row=0, column=i, padx=12, pady=10)
+            card.grid_propagate(False)
+
+            content = ctk.CTkFrame(card, fg_color="transparent")
+            content.place(relx=0.5, rely=0.5, anchor="center")
+
+            ctk.CTkLabel(content, text=opt["icon"], font=("Segoe UI Emoji", 36)).pack(pady=(0, 5))
+            ctk.CTkLabel(content, text=opt["title"], font=("Aileron", 14, "bold"),
+                        text_color=("#001D39", "white")).pack(pady=(0, 5))
+            ctk.CTkLabel(content, text=opt["desc"], font=("Aileron", 10),
+                        text_color=("gray40", "gray70"), justify="center").pack(pady=(0, 10))
+            btn = ctk.CTkButton(content, text="Selecionar", height=32, corner_radius=20,
+                         fg_color=opt["color"], hover_color="#49769F",
+                         text_color="white", font=("Aileron", 11, "bold"),
+                         command=lambda k=opt["key"]: _select_business(k),
+                         state="disabled")
+            btn.pack()
+            select_buttons.append(btn)
+
+        # --- Aceite dos Termos de Uso ---
+        terms_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        terms_frame.pack(pady=(20, 0))
+
+        terms_var = ctk.BooleanVar(value=False)
+
+        def _toggle_terms():
+            state = "normal" if terms_var.get() else "disabled"
+            for btn in select_buttons:
+                btn.configure(state=state)
+
+        ctk.CTkCheckBox(
+            terms_frame,
+            text="Li e concordo com os Termos de Uso e Licença de Software",
+            variable=terms_var,
+            command=_toggle_terms,
+            font=("Aileron", 12),
+            text_color=("#001D39", "white"),
+            checkbox_width=20,
+            checkbox_height=20,
+            corner_radius=5,
+            border_color=("#49769F", "#7BBDE8"),
+            fg_color="#49769F",
+            hover_color="#3A6A8F",
+        ).pack(side="left", padx=(0, 8))
+
+        def _open_terms():
+            try:
+                base_path = get_base_path()
+                terms_path = os.path.join(base_path, "TERMOS_DE_USO.txt")
+                if not os.path.exists(terms_path):
+                    terms_path = os.path.join(os.path.dirname(sys.executable), "TERMOS_DE_USO.txt")
+                if os.path.exists(terms_path):
+                    os.startfile(terms_path)
+                else:
+                    messagebox.showinfo("Termos de Uso", "O arquivo TERMOS_DE_USO.txt não foi encontrado.\nConsulte os termos no GUIA_DO_USUARIO.txt (seção 6).")
+            except Exception:
+                messagebox.showinfo("Termos de Uso", "Não foi possível abrir o arquivo.\nConsulte os termos no GUIA_DO_USUARIO.txt (seção 6).")
+
+        ctk.CTkButton(
+            terms_frame,
+            text="Ler Termos",
+            width=100,
+            height=28,
+            corner_radius=15,
+            fg_color="transparent",
+            hover_color=("#E0E0E0", "#333333"),
+            text_color=("#49769F", "#7BBDE8"),
+            border_width=1,
+            border_color=("#49769F", "#7BBDE8"),
+            font=("Aileron", 11),
+            command=_open_terms,
+        ).pack(side="left")
+
+        # Confirmação ao fechar
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    # --- Mapeamento de botões para chaves de permissão ---
+    _PERMISSAO_MAP = {
+        "SALDO": "gastos", "GASTOS": "gastos", "CAIXA": "caixa", "KITS": "kits",
+        "CATEGORIAS": "categorias", "FORNECEDORES": "fornecedores", "CLIENTES": "clientes",
+        "ANOTA TUDO": "vender",
+        "VENDEDORES": "vendedores", "CONFIG": "ver_config", "CHAT IA": "chat_ia",
+        "INSUMOS": "insumos", "PRODUÇÃO": "producao", "TROCAS": "vender",
+        "REPOSIÇÃO": "adicionar", "MESAS": "mesas", "COMANDAS": "mesas",
+        "COZINHA": "mesas", "CONTAS PAGAR": "contas_pagar", "ETIQUETAS": "etiquetas",
+        "ADICIONAR": "adicionar", "VENDER": "vender", "SERVIÇO": "vender",
+        "LISTA": "editar", "RELATORIO": "ver_relatorio", "DRE": "ver_relatorio",
+    }
+
+    def _tem_permissao(self, acao_btn):
+        """Verifica se o usuário logado tem permissão para a ação."""
+        if self.current_user is None:
+            return True
+        perfil = self.current_user.get("perfil", "vendedor")
+        chave = self._PERMISSAO_MAP.get(acao_btn, "")
+        if not chave:
+            return perfil == "admin"
+        return self.db.usuario_tem_permissao(perfil, chave)
+
+    def _show_login_screen(self):
+        """Tela de login — autenticação do usuário."""
+        self._login_frame = ctk.CTkFrame(self, fg_color=("#F0F0F5", "#191919"))
+        self._login_frame.grid(row=0, column=0, rowspan=4, columnspan=2, sticky="nsew")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        inner = ctk.CTkFrame(self._login_frame, fg_color="transparent")
+        inner.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Logo
+        try:
+            base_path = get_base_path()
+            icon_path = os.path.join(base_path, "icon", "icon-cubo.png")
+            if os.path.exists(icon_path):
+                pil_img = Image.open(icon_path)
+                self._login_logo = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(100, 100))
+                ctk.CTkLabel(inner, image=self._login_logo, text="").pack(pady=(0, 10))
+        except Exception:
+            pass
+
+        ctk.CTkLabel(inner, text="Estoke ao Cubo",
+                     font=("Aileron", 22, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 5))
+        ctk.CTkLabel(inner, text="Faça login para continuar",
+                     font=("Aileron", 13), text_color=("gray40", "gray70")).pack(pady=(0, 20))
+
+        login_card = ctk.CTkFrame(inner, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        login_card.pack(padx=20, pady=10)
+
+        ctk.CTkLabel(login_card, text="Usuário:", font=("Aileron", 12, "bold"),
+                     text_color=("#001D39", "white")).pack(anchor="w", padx=30, pady=(20, 2))
+        entry_user = ctk.CTkEntry(login_card, height=38, placeholder_text="Login do usuário", width=290)
+        entry_user.pack(padx=30, pady=(2, 10))
+
+        ctk.CTkLabel(login_card, text="Senha:", font=("Aileron", 12, "bold"),
+                     text_color=("#001D39", "white")).pack(anchor="w", padx=30, pady=(0, 2))
+        entry_pass = ctk.CTkEntry(login_card, height=38, placeholder_text="Senha", show="*", width=290)
+        entry_pass.pack(padx=30, pady=(2, 10))
+
+        lbl_erro = ctk.CTkLabel(login_card, text="", font=("Aileron", 11), text_color="#FF6B6B")
+        lbl_erro.pack()
+
+        def _fazer_login():
+            login_val = entry_user.get().strip()
+            senha_val = entry_pass.get()
+            if not login_val or not senha_val:
+                lbl_erro.configure(text="Preencha login e senha.")
+                return
+            user = self.db.autenticar_usuario(login_val, senha_val)
+            if user:
+                self.current_user = user
+                self._login_frame.destroy()
+                self.grid_columnconfigure(0, weight=0)
+                self.grid_columnconfigure(1, weight=1)
+                self.grid_rowconfigure(0, weight=0)
+                self.grid_rowconfigure(1, weight=1)
+                self._build_main_ui()
+            else:
+                lbl_erro.configure(text="Usuário ou senha incorretos!")
+
+        ctk.CTkButton(login_card, text="Entrar", command=_fazer_login,
+                      fg_color="#0A4174", hover_color="#062F56", text_color="white",
+                      font=("Aileron", 13, "bold"), height=40, width=290).pack(padx=30, pady=(10, 5))
+
+        ctk.CTkLabel(login_card, text="Primeiro acesso? Use: admincentral / admin9438",
+                     font=("Aileron", 10), text_color=("gray50", "gray60")).pack(pady=(0, 15))
+
+        entry_user.focus_set()
+        entry_pass.bind("<Return>", lambda e: _fazer_login())
+
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _build_main_ui(self):
+        """Constrói a interface principal após o tipo de negócio ser definido."""
+        self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0, fg_color=("white", "#2B2B2B"))
+        self.sidebar_frame.grid(row=0, column=0, rowspan=4, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(1, weight=1)
+        self.sidebar_frame.grid_columnconfigure(0, weight=1)
+
+        # Logo com imagem (topo fixo)
+        try:
+            base_path = get_base_path()
+            icon_path = os.path.join(base_path, "icon", "icon-cubo.png")
+            
+            if os.path.exists(icon_path):
+                pil_image = Image.open(icon_path)
+                self.logo_image = ctk.CTkImage(light_image=pil_image, 
+                                        dark_image=pil_image, 
+                                        size=(120, 120))
+                
+                logo_img_label = ctk.CTkLabel(self.sidebar_frame, image=self.logo_image, text="")
+                logo_img_label.grid(row=0, column=0, padx=15, pady=(15, 10))
+            else:
+                self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Estoke ao Cubo", font=ctk.CTkFont(family="Aileron", size=20, weight="bold"), text_color="#001D39")
+                self.logo_label.grid(row=0, column=0, padx=15, pady=(15, 10))
+        except Exception as e:
+            logger.warning("Erro ao carregar logo: %s", e)
+            self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Estoke ao Cubo", font=ctk.CTkFont(family="Aileron", size=20, weight="bold"), text_color="#001D39")
+            self.logo_label.grid(row=0, column=0, padx=15, pady=(15, 10))
+
+        # Botões da Sidebar dentro de scrollable frame
+        self._sidebar_scroll = ctk.CTkScrollableFrame(self.sidebar_frame, fg_color="transparent",
+                                                       scrollbar_button_color=("#CCCCCC", "#555555"))
+        self._sidebar_scroll.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+        self._sidebar_scroll.grid_columnconfigure(0, weight=1)
+
+        self.sidebar_buttons = [
+            "SALDO", "GASTOS", "CAIXA", "KITS", "CATEGORIAS", "FORNECEDORES",
+            "CLIENTES", "ANOTA TUDO", "VENDEDORES", "CONTAS PAGAR", "ETIQUETAS", "CONFIG", "CHAT IA"
+        ]
+        
+        # Botões condicionais por tipo de negócio
+        if self.business_type in ("padaria_acougue", "artesanato"):
+            self.sidebar_buttons.insert(2, "INSUMOS")
+            self.sidebar_buttons.insert(3, "PRODUÇÃO")
+        if self.business_type == "loja_roupa":
+            self.sidebar_buttons.insert(2, "TROCAS")
+        if self.business_type == "variados":
+            self.sidebar_buttons.insert(2, "REPOSIÇÃO")
+        if self.business_type == "restaurante":
+            self.sidebar_buttons.insert(2, "MESAS")
+            self.sidebar_buttons.insert(3, "COMANDAS")
+            self.sidebar_buttons.insert(4, "COZINHA")
+            self.sidebar_buttons.insert(5, "INSUMOS")
+            self.sidebar_buttons.insert(6, "PRODUÇÃO")
+        
+        for i, btn_text in enumerate(self.sidebar_buttons):
+            btn = ctk.CTkButton(self._sidebar_scroll, text=btn_text, height=44, corner_radius=30,
+                                fg_color=("#EBEBF0", "#3A3A3A"), text_color=("#333333", "white"), 
+                                hover_color=("#D9D9E0", "#4A4A4A"),
+                                border_width=2, border_color=("white", "#555555"),
+                                font=ctk.CTkFont(family="Aileron", size=13, weight="bold"),
+                                command=lambda t=btn_text: self.sidebar_event(t))
+            btn.grid(row=i, column=0, padx=15, pady=5, sticky="ew")
+
+        # Usuário logado + botão sair (fundo fixo da sidebar)
+        user_bottom = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        user_bottom.grid(row=2, column=0, padx=10, pady=(5, 2), sticky="ew")
+        user_bottom.grid_columnconfigure(0, weight=1)
+
+        if self.current_user:
+            perfil_emoji = {"admin": "👑", "gerente": "📊", "vendedor": "🛒", "caixa": "💰"}.get(self.current_user.get("perfil", ""), "👤")
+            ctk.CTkLabel(user_bottom, text=f"{perfil_emoji} {self.current_user['nome']}",
+                        font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).grid(row=0, column=0, sticky="ew")
+            ctk.CTkButton(user_bottom, text="Sair", width=60, height=28, corner_radius=15,
+                         fg_color="#E74C3C", hover_color="#C0392B", text_color="white",
+                         font=("Aileron", 10, "bold"), command=self._logout).grid(row=1, column=0, pady=(3, 0))
+
+        # Switch de Modo Escuro (fundo fixo da sidebar)
+        self.appearance_mode_btn = ctk.CTkButton(self.sidebar_frame, text="☀", width=40, height=40, corner_radius=20,
+                                                fg_color=("#EBEBF0", "#3A3A3A"), text_color=("#FDB813", "#FDB813"),
+                                                hover_color=("#D9D9E0", "#4A4A4A"),
+                                                font=ctk.CTkFont(size=20),
+                                                command=self.toggle_appearance_mode)
+        self.appearance_mode_btn.grid(row=3, column=0, padx=15, pady=(5, 10))
+
+        # --- Top Bar (Direita Superior) ---
+        self.topbar_frame = ctk.CTkFrame(self, height=80, corner_radius=0, fg_color="transparent")
+        self.topbar_frame.grid(row=0, column=1, sticky="new", padx=20, pady=10)
+        
+        self.top_buttons = ["ADICIONAR", "VENDER", "SERVIÇO", "LISTA", "RELATORIO", "DRE"]
+        
+        # Cores personalizadas para cada botão (Tons de azul)
+        button_configs = {
+            "ADICIONAR": {"fg": "#AED6F1", "hover": "#85C1E9", "text": "#001D39"}, # Azul muito claro
+            "VENDER":    {"fg": "#7BBDE8", "hover": "#49769F", "text": "#001D39"}, # Azul original
+            "SERVIÇO":   {"fg": "#6AADDA", "hover": "#5899C4", "text": "#001D39"}, # Azul intermediário
+            "LISTA":     {"fg": "#5DADE2", "hover": "#3498DB", "text": "#001D39"}, # Azul médio claro
+            "RELATORIO": {"fg": "#2874A6", "hover": "#1B4F72", "text": "white"},   # Azul escuro
+            "DRE":       {"fg": "#1A5276", "hover": "#154360", "text": "white"},   # Azul marinho
+        }
+
+        for i, btn_text in enumerate(self.top_buttons):
+            # Botões superiores com estilo "Glassy"
+            # Configuração padrão
+            fg_color = ("#EBEBF0", "#3A3A3A")
+            text_color = ("#333333", "white")
+            hover_color = ("#D9D9E0", "#4A4A4A")
+            
+            # Aplicar cores personalizadas se existir na configuração
+            if btn_text in button_configs:
+                config = button_configs[btn_text]
+                fg_color = config["fg"]
+                text_color = config["text"]
+                hover_color = config["hover"]
+
+            btn = ctk.CTkButton(self.topbar_frame, text=btn_text, width=120, height=45, corner_radius=30,
+                                fg_color=fg_color, hover_color=hover_color, text_color=text_color,
+                                border_width=2, border_color=("white", "#555555"),
+                                font=ctk.CTkFont(family="Aileron", size=13, weight="bold"),
+                                command=lambda t=btn_text: self.topbar_event(t))
+            btn.grid(row=0, column=i, padx=10)
+
+        btn_fullscreen = ctk.CTkButton(self.topbar_frame, text="F11", width=90, height=45, corner_radius=30,
+                                       fg_color="#154360", hover_color="#0F3B5A", text_color="white",
+                                       border_width=2, border_color=("white", "#555555"),
+                                       font=ctk.CTkFont(family="Aileron", size=13, weight="bold"),
+                                       command=self._toggle_fullscreen)
+        btn_fullscreen.grid(row=0, column=len(self.top_buttons), padx=10)
+
+        # --- Área Principal (Conteúdo) ---
+        self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.main_frame.grid(row=1, column=1, sticky="nsew", padx=20, pady=20)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_columnconfigure(1, weight=1)
+        self.main_frame.grid_rowconfigure(0, weight=0)  # Metas não expandem
+        self.main_frame.grid_rowconfigure(1, weight=1)  # Gráficos expandem
+
+        # Metas (Checklist)
+        self.create_metas_checklist()
+        
+        # Gráficos
+        self.create_charts()
+
+        # --- Backup automático diário ---
+        try:
+            success, msg = self.db.verificar_backup_diario()
+            if success and "criado" not in msg.lower():
+                logger.info("Backup diário: %s", msg)
+            elif success:
+                logger.info("Backup automático criado com sucesso.")
+        except Exception as e:
+            logger.warning("Erro no backup automático: %s", e)
+
+        # --- Alerta de produtos vencendo (toast não-bloqueante) ---
+        try:
+            df_vencendo = self.db.verificar_produtos_vencendo(dias_alerta=7)
+            if not df_vencendo.empty:
+                nomes = ", ".join(df_vencendo['nome'].tolist()[:5])
+                total_v = len(df_vencendo)
+                msg = f"{total_v} produto(s) com validade próxima ou vencidos: {nomes}"
+                if total_v > 5:
+                    msg += "..."
+                self.after(1500, lambda: self.notifier.notify(
+                    "Alerta de Validade", msg, tipo="warning", duracao=8000
+                ))
+        except Exception as e:
+            logger.debug("Erro verificar validade: %s", e)
+
+        # --- Atalhos de Teclado Globais ---
+        self.bind_all("<Control-n>", lambda e: self.topbar_event("ADICIONAR"))
+        self.bind_all("<Control-Shift-V>", lambda e: self.topbar_event("VENDER"))
+        self.bind_all("<Control-e>", lambda e: self.topbar_event("LISTA"))
+        self.bind_all("<Control-r>", lambda e: self.topbar_event("RELATORIO"))
+        self.bind_all("<Control-g>", lambda e: self.sidebar_event("GASTOS"))
+        self.bind_all("<Control-k>", lambda e: self.sidebar_event("KITS"))
+        self.bind_all("<F5>", lambda e: self.refresh_dashboard())
+
+        # --- Confirmação ao Fechar ---
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # --- Dashboard Auto-Refresh (a cada 60 segundos) ---
+        self._start_auto_refresh()
+
+        # --- Notificações Toast de Alertas (após 3s para não bloquear boot) ---
+        self.after(3000, self._exibir_alertas_iniciais)
+
+        # --- Iniciar API REST em background (se disponível) ---
+        self._iniciar_api_server()
+
+    def _forcar_icone(self):
+        """Força a reaplicação do ícone na titlebar e taskbar."""
+        try:
+            if self._icon_path_ico and os.path.exists(self._icon_path_ico):
+                self.iconbitmap(self._icon_path_ico)
+        except Exception:
+            pass
+
+    def _toggle_fullscreen(self, event=None):
+        self._fullscreen = not self._fullscreen
+        self.attributes("-fullscreen", self._fullscreen)
+
+    def _exit_fullscreen(self, event=None):
+        if self._fullscreen:
+            self._fullscreen = False
+            self.attributes("-fullscreen", False)
+    
+    def _on_closing(self):
+        """Confirmação antes de fechar a aplicação."""
+        if messagebox.askyesno("Sair", "Deseja realmente fechar o Estoke ao Cubo?"):
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.destroy()
+
+    def _logout(self):
+        """Faz logout e retorna à tela de login."""
+        if messagebox.askyesno("Sair da Conta", "Deseja trocar de usuário?"):
+            self.current_user = None
+            self._pdv_dialog = None
+            # Destruir todos os widgets da UI principal
+            for widget in self.winfo_children():
+                widget.destroy()
+            self._show_login_screen()
+    
+    def toggle_appearance_mode(self):
+        if ctk.get_appearance_mode() == "Light":
+            ctk.set_appearance_mode("Dark")
+            self.appearance_mode_btn.configure(text="🌙", text_color="#C2C2C2") # Lua cinza claro
+        else:
+            ctk.set_appearance_mode("Light")
+            self.appearance_mode_btn.configure(text="☀", text_color="#FDB813") # Sol amarelo
+        
+        # Atualizar gráficos para refletir a mudança de tema
+        self.after(200, self.refresh_dashboard)
+
+    def refresh_dashboard(self):
+        """Limpa e recarrega os gráficos e metas em tempo real"""
+        import matplotlib.pyplot as plt
+        # Atualizar metas
+        self.refresh_metas_list()
+        
+        # Fechar figuras matplotlib anteriores para evitar memory leak
+        plt.close('all')
+        
+        # Limpar o frame de gráficos
+        for widget in self.charts_frame.winfo_children():
+            widget.destroy()
+        
+        # Recriar os gráficos
+        self.create_charts_content()
+        self.update_prediction_display()
+    
+    def create_metas_checklist(self):
+        """Cria painel de OS em tempo real e tarefas no dashboard (lado a lado)"""
+        # Frame principal (Container para OS e tarefas)
+        self.metas_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.metas_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        self.metas_frame.grid_columnconfigure(0, weight=1)
+        self.metas_frame.grid_columnconfigure(1, weight=1)
+        
+        # ===== CARD DE SERVIÇOS / OS (lado esquerdo) =====
+        self.metas_card = ctk.CTkFrame(self.metas_frame, fg_color=("white", "#2B2B2B"), corner_radius=20, height=200,
+                                        border_width=1, border_color=("#E6E6E6", "#444444"))
+        self.metas_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=0)
+        self.metas_card.grid_columnconfigure(0, weight=1)
+        self.metas_card.grid_rowconfigure(1, weight=1)
+        
+        # Cabeçalho OS
+        os_cfg = self._get_os_config()
+        os_header = ctk.CTkFrame(self.metas_card, fg_color="transparent")
+        os_header.grid(row=0, column=0, sticky="ew", padx=20, pady=(15, 10))
+        os_header.grid_columnconfigure(0, weight=1)
+        
+        ctk.CTkLabel(os_header, text=os_cfg["title"], font=ctk.CTkFont(family="Aileron", size=14, weight="bold"), text_color=("#001D39", "white")).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(os_header, text="+ Novo", width=85, height=28, 
+                    fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F",
+                    font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
+                    command=self.open_servico_dialog).grid(row=0, column=1, sticky="e", padx=5)
+        
+        # Frame rolável para OS
+        self.metas_scroll_frame = ctk.CTkScrollableFrame(self.metas_card, fg_color="transparent")
+        self.metas_scroll_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 15))
+        
+        # ===== CARD DE TAREFAS (lado direito) =====
+        # Card com borda suave
+        self.tarefas_card = ctk.CTkFrame(self.metas_frame, fg_color=("white", "#2B2B2B"), corner_radius=20, height=200,
+                                        border_width=1, border_color=("#E6E6E6", "#444444"))
+        self.tarefas_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=0)
+        self.tarefas_card.grid_columnconfigure(0, weight=1)
+        self.tarefas_card.grid_rowconfigure(1, weight=1)
+        
+        # Cabeçalho de tarefas
+        tarefas_header = ctk.CTkFrame(self.tarefas_card, fg_color="transparent")
+        tarefas_header.grid(row=0, column=0, sticky="ew", padx=20, pady=(15, 10))
+        tarefas_header.grid_columnconfigure(0, weight=1)
+        
+        ctk.CTkLabel(tarefas_header, text="TAREFAS", font=ctk.CTkFont(family="Aileron", size=14, weight="bold"), text_color=("#001D39", "white")).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(tarefas_header, text="+ Tarefa", width=85, height=28, 
+                    fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F",
+                    font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
+                    command=self.open_quick_add_tarefa_dialog).grid(row=0, column=1, sticky="e", padx=5)
+        
+        # Frame rolável para tarefas
+        self.tarefas_scroll_frame = ctk.CTkScrollableFrame(self.tarefas_card, fg_color="transparent")
+        self.tarefas_scroll_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 15))
+        
+        self.refresh_metas_list()
+    
+    def refresh_metas_list(self):
+        """Atualiza a lista de serviços (OS) e tarefas no checklist"""
+        # Limpar OS antigas
+        for widget in self.metas_scroll_frame.winfo_children():
+            widget.destroy()
+        
+        # Limpar tarefas antigas
+        for widget in self.tarefas_scroll_frame.winfo_children():
+            widget.destroy()
+        
+        # ===== SERVIÇOS / ORDENS DE SERVIÇO =====
+        os_cfg = self._get_os_config()
+        status_os_all = os_cfg["statuses"]
+        status_colors = os_cfg["colors"]
+        status_icons = os_cfg["icons"]
+
+        try:
+            df_servicos = self.db.listar_servicos(dias=90)
+        except Exception:
+            df_servicos = None
+
+        if df_servicos is None or df_servicos.empty:
+            ctk.CTkLabel(self.metas_scroll_frame, text="Nenhum serviço recente.",
+                        font=ctk.CTkFont(family="Aileron", size=10), text_color="gray").pack(pady=10)
+        else:
+            # Contagem por status
+            ativos = df_servicos[~df_servicos.get('status_os', pd.Series(dtype=str)).isin(["Concluído", "Entregue", ""])]
+            total_ativos = len(ativos)
+
+            # Resumo compacto
+            resumo_frame = ctk.CTkFrame(self.metas_scroll_frame, fg_color="transparent")
+            resumo_frame.pack(fill="x", padx=5, pady=(0, 8))
+            ctk.CTkLabel(resumo_frame, text=f"{total_ativos} OS ativas",
+                        font=ctk.CTkFont(family="Aileron", size=9, weight="bold"),
+                        text_color=("#28a745", "#6BCB77") if total_ativos == 0 else ("#E67E22", "#F39C12")).pack(side="left")
+
+            # Listar OS ativas (não concluídas/entregues), mais recentes primeiro
+            if not ativos.empty:
+                for _, srv in ativos.head(8).iterrows():
+                    st = srv.get('status_os', 'Recebido')
+                    cor = status_colors.get(st, "#888")
+                    icon = status_icons.get(st, "🔧")
+                    equip = srv.get('equipamento', '') or ''
+                    desc = srv.get('descricao', '') or ''
+                    cliente = srv.get('cliente', '') or ''
+                    display = equip if equip else desc[:40]
+
+                    item_f = ctk.CTkFrame(self.metas_scroll_frame, fg_color=("white", "#3A3A3A"),
+                                         corner_radius=10, border_width=2, border_color=cor)
+                    item_f.pack(fill="x", padx=5, pady=3)
+
+                    content_f = ctk.CTkFrame(item_f, fg_color="transparent")
+                    content_f.pack(fill="x", padx=10, pady=8, side="left", expand=True)
+
+                    # Ícone
+                    ctk.CTkLabel(content_f, text=icon, font=ctk.CTkFont(size=16)).pack(side="left", padx=(0, 8))
+
+                    # Texto
+                    txt_f = ctk.CTkFrame(content_f, fg_color="transparent")
+                    txt_f.pack(side="left", fill="both", expand=True)
+                    ctk.CTkLabel(txt_f, text=display, font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
+                                text_color=("#10367D", "white"), wraplength=200).pack(anchor="w")
+                    if cliente:
+                        ctk.CTkLabel(txt_f, text=cliente, font=ctk.CTkFont(family="Aileron", size=8),
+                                    text_color=("gray", "#AAA")).pack(anchor="w")
+
+                    # Badge de status
+                    ctk.CTkLabel(item_f, text=f" {st} ", font=ctk.CTkFont(family="Aileron", size=9, weight="bold"),
+                                text_color="white", fg_color=cor, corner_radius=6).pack(side="right", padx=10, pady=8)
+
+                    # Botão avançar
+                    sid = srv.get('id')
+                    if st not in ("Concluído", "Entregue"):
+                        idx = status_os_all.index(st) if st in status_os_all else 0
+                        next_st = status_os_all[min(idx + 1, len(status_os_all) - 1)]
+
+                        def _adv(s_id=sid, ns=next_st):
+                            self.db.atualizar_status_servico(s_id, ns)
+                            self.refresh_metas_list()
+
+                        ctk.CTkButton(item_f, text="→", width=28, height=28,
+                                     fg_color=cor, text_color="white", hover_color="#49769F",
+                                     font=ctk.CTkFont(size=12, weight="bold"),
+                                     command=_adv).pack(side="right", padx=(0, 4), pady=8)
+        
+        # ===== TAREFAS =====
+        df_tarefas = self.db.listar_tarefas_estabelecimento()
+        
+        if df_tarefas.empty:
+            ctk.CTkLabel(self.tarefas_scroll_frame, text="Nenhuma tarefa cadastrada.", 
+                        font=ctk.CTkFont(family="Aileron", size=10), text_color="gray").pack(pady=10)
+        else:
+            # Separar tarefas por status
+            tarefas_pendentes = df_tarefas[df_tarefas['status'] == 'Pendente']
+            tarefas_progresso = df_tarefas[df_tarefas['status'] == 'Em Progresso']
+            tarefas_concluidas = df_tarefas[df_tarefas['status'] == 'Concluído']
+            
+            # Contador de progresso
+            total_t = len(df_tarefas)
+            concluidas_t = len(tarefas_concluidas)
+            progresso_t = len(tarefas_progresso)
+            progress_frame_t = ctk.CTkFrame(self.tarefas_scroll_frame, fg_color="transparent")
+            progress_frame_t.pack(fill="x", padx=5, pady=(0, 8))
+            ctk.CTkLabel(progress_frame_t, text=f"{concluidas_t}/{total_t} feitas  •  {progresso_t} em andamento", 
+                        font=ctk.CTkFont(family="Aileron", size=9, weight="bold"), 
+                        text_color=("#28a745", "#6BCB77") if concluidas_t == total_t else ("#666", "#AAA")).pack(side="left")
+            progress_bar_t = ctk.CTkProgressBar(progress_frame_t, height=6, width=120, 
+                                                progress_color="#6EA2B3", fg_color=("#E0E0E0", "#444"))
+            progress_bar_t.set(concluidas_t / total_t if total_t > 0 else 0)
+            progress_bar_t.pack(side="right", padx=(5, 0))
+            
+            # Mostrar tarefas pendentes
+            if not tarefas_pendentes.empty:
+                for index, row in tarefas_pendentes.iterrows():
+                    self.create_tarefa_item(row)
+            
+            # Mostrar tarefas em progresso
+            if not tarefas_progresso.empty:
+                if not tarefas_pendentes.empty:
+                    sep_frame = ctk.CTkFrame(self.tarefas_scroll_frame, fg_color="#EBEBEB", height=2)
+                    sep_frame.pack(fill="x", padx=5, pady=10)
+                for index, row in tarefas_progresso.iterrows():
+                    self.create_tarefa_item(row)
+            
+            # Mostrar tarefas concluídas
+            if not tarefas_concluidas.empty:
+                if not tarefas_pendentes.empty or not tarefas_progresso.empty:
+                    sep_frame = ctk.CTkFrame(self.tarefas_scroll_frame, fg_color="#EBEBEB", height=2)
+                    sep_frame.pack(fill="x", padx=5, pady=10)
+                for index, row in tarefas_concluidas.iterrows():
+                    self.create_tarefa_item(row)
+    
+    def create_tarefa_item(self, tarefa_row):
+        """Cria um item de tarefa de estabelecimento"""
+        is_completed = tarefa_row['status'] == 'Concluído'
+        is_progress = tarefa_row['status'] == 'Em Progresso'
+        
+        item_frame = ctk.CTkFrame(self.tarefas_scroll_frame, fg_color=("#F5F5F5", "#2B2B2B") if is_completed else ("white", "#3A3A3A"), corner_radius=10)
+        item_frame.pack(fill="x", padx=5, pady=5)
+        
+        # Content frame
+        content_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
+        content_frame.pack(fill="x", padx=10, pady=10, side="left", expand=True)
+        
+        # Prioridade como indicador visual
+        prioridade = tarefa_row['prioridade']
+        cor_prioridade = {"Alta": "#FF6B6B", "Média": "#6EA2B3", "Baixa": "#7BBDE8"}.get(prioridade, "#FFD93D")
+        status_icon = "✅" if is_completed else "🔄" if is_progress else "⬚"
+        
+        ctk.CTkLabel(content_frame, text=status_icon, font=ctk.CTkFont(family="Aileron", size=16, weight="bold"), 
+                    text_color=cor_prioridade).pack(side="left", padx=(0, 8))
+        
+        # Texto
+        text_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+        text_frame.pack(side="left", fill="both", expand=True)
+        
+        titulo_color = "#888888" if is_completed else ("#10367D", "white")
+        titulo_font = ctk.CTkFont(family="Aileron", size=10, weight="bold") if not is_completed else ctk.CTkFont(family="Aileron", size=10)
+        
+        # Área + Tarefa
+        display_text = f"{tarefa_row['area_local']} - {tarefa_row['tarefa']}"
+        ctk.CTkLabel(text_frame, text=display_text, font=titulo_font, text_color=titulo_color, wraplength=200).pack(anchor="w")
+        
+        # Status + Prioridade
+        status_text = f"{tarefa_row['status']}  •  {prioridade}"
+        status_color = "#888888" if is_completed else cor_prioridade
+        ctk.CTkLabel(text_frame, text=status_text, font=ctk.CTkFont(family="Aileron", size=8, weight="bold"), 
+                    text_color=status_color).pack(anchor="w", pady=(2, 0))
+        
+        # Botões de ação
+        action_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
+        action_frame.pack(side="right", padx=10, pady=10)
+        
+        # Botão de status com label descritivo
+        if tarefa_row['status'] == 'Pendente':
+            proximo_status = "Em Progresso"
+            btn_text = "▶ Iniciar"
+            cor_btn = "#6EA2B3"
+            text_cor = "white"
+        elif tarefa_row['status'] == 'Em Progresso':
+            proximo_status = "Concluído"
+            btn_text = "✓ Concluir"
+            cor_btn = "#28a745"
+            text_cor = "white"
+        else:
+            proximo_status = "Pendente"
+            btn_text = "↩ Reabrir"
+            cor_btn = "#10367D"
+            text_cor = "white"
+        
+        def update_tarefa_status(tarefa_id=tarefa_row['id'], novo_status=proximo_status):
+            self.db.atualizar_status_estabelecimento(tarefa_id, novo_status)
+            self.refresh_metas_list()
+        
+        ctk.CTkButton(action_frame, text=btn_text, width=75, height=28,
+                    fg_color=cor_btn, text_color=text_cor,
+                    hover_color=cor_btn, font=ctk.CTkFont(family="Aileron", size=9, weight="bold"),
+                    command=update_tarefa_status).pack(side="left", padx=2)
+        
+        # Botão remover
+        def delete_tarefa(tarefa_id=tarefa_row['id']):
+            if messagebox.askyesno("Confirmar", "Remover esta tarefa?", parent=self):
+                self.db.remover_tarefa_estabelecimento(tarefa_id)
+                self.refresh_metas_list()
+        
+        ctk.CTkButton(action_frame, text="✕", width=28, height=28,
+                    fg_color="red", text_color="white", hover_color="darkred",
+                    font=ctk.CTkFont(family="Aileron", size=9, weight="bold"),
+                    command=delete_tarefa).pack(side="left", padx=2)
+
+    def open_quick_add_tarefa_dialog(self):
+        """Diálogo rápido para adicionar tarefa direto do dashboard."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Adicionar Tarefa")
+        dialog.geometry("400x400")
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.focus_set()
+        
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        ctk.CTkLabel(main_frame, text="Nova Tarefa", font=ctk.CTkFont(family="Aileron", size=16, weight="bold"), text_color=("#001D39", "white")).pack(pady=15)
+        
+        ctk.CTkLabel(main_frame, text="Área/Local:", font=ctk.CTkFont(family="Aileron", weight="bold"), text_color=("#001D39", "white")).pack(pady=(10, 0), padx=20, anchor="w")
+        entry_area = ctk.CTkEntry(main_frame, placeholder_text="Ex: Cozinha, Estoque...", height=35)
+        entry_area.pack(pady=5, padx=20, fill="x")
+        
+        ctk.CTkLabel(main_frame, text="Tarefa:", font=ctk.CTkFont(family="Aileron", weight="bold"), text_color=("#001D39", "white")).pack(pady=(10, 0), padx=20, anchor="w")
+        entry_tarefa = ctk.CTkEntry(main_frame, placeholder_text="Ex: Organizar prateleiras...", height=35)
+        entry_tarefa.pack(pady=5, padx=20, fill="x")
+        
+        ctk.CTkLabel(main_frame, text="Prioridade:", font=ctk.CTkFont(family="Aileron", weight="bold"), text_color=("#001D39", "white")).pack(pady=(10, 0), padx=20, anchor="w")
+        var_prioridade = ctk.StringVar(value="Média")
+        combo_prioridade = ctk.CTkComboBox(main_frame, variable=var_prioridade, 
+                                          values=["Baixa", "Média", "Alta"], state="readonly", height=35)
+        combo_prioridade.pack(pady=5, padx=20, fill="x")
+        
+        def salvar():
+            area = entry_area.get().strip()
+            tarefa = entry_tarefa.get().strip()
+            if not area or not tarefa:
+                messagebox.showerror("Erro", "Preencha Área/Local e Tarefa.", parent=dialog)
+                dialog.lift()
+                dialog.focus_force()
+                return
+            self.db.adicionar_tarefa_estabelecimento(area, tarefa, var_prioridade.get())
+            messagebox.showinfo("Sucesso", "Tarefa adicionada!", parent=dialog)
+            dialog.destroy()
+            self.refresh_metas_list()
+        
+        ctk.CTkButton(main_frame, text="Adicionar Tarefa", command=salvar, height=40,
+                    fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F").pack(pady=20, padx=20, fill="x", side="bottom")
+
+    def create_charts(self):
+        # Frame para gráficos com scroll e borda suave
+        # Alterado para transparent para mostrar o background
+        # Borda azul clara fraca conforme solicitado
+        self.charts_frame = ctk.CTkScrollableFrame(self.main_frame, fg_color="transparent", corner_radius=20,
+                                                border_width=1, border_color=("#7BBDE8", "#3A506B"))
+        self.charts_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
+        self.charts_frame.grid_rowconfigure(0, minsize=320)  # Altura mínima para os gráficos
+        
+        # Configurar grid do card
+        self.charts_frame.grid_columnconfigure(0, weight=1)
+        self.charts_frame.grid_columnconfigure(1, weight=1)
+        
+        self.create_charts_content()
+    
+    def create_charts_content(self):
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        df_produtos = self.db.listar_produtos()
+        
+        # Definir cores baseadas no tema atual
+        is_dark = ctk.get_appearance_mode() == "Dark"
+        bg_color = "#2B2B2B" if is_dark else "#F0F0F5"
+        text_color = "white" if is_dark else "black"
+        
+        if not df_produtos.empty:
+            # Pegar os 5 produtos com maior quantidade para não poluir o gráfico
+            df_top = df_produtos.nlargest(5, 'quantidade')
+            labels = df_top['nome'].tolist()
+            sizes = df_top['quantidade'].tolist()
+            
+            # Se houver muitos outros, agrupar em "Outros"
+            outros = df_produtos['quantidade'].sum() - df_top['quantidade'].sum()
+            if outros > 0:
+                labels.append("Outros")
+                sizes.append(outros)
+        else:
+            labels = ['Sem Dados']
+            sizes = [1]
+
+        # Alterado facecolor para combinar com o fundo
+        fig_pie = Figure(figsize=(4.5, 3), dpi=100, facecolor=bg_color)
+        ax_pie = fig_pie.add_subplot(111)
+        # Cores da paleta
+        colors = ['#10367D', '#7BBDE8', '#EBEBEB', '#0D2B63', '#49769F', '#CCCCCC']
+        
+        wedges, texts, autotexts = ax_pie.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, colors=colors[:len(labels)])
+        
+        # Ajustar cor do texto do gráfico de pizza
+        for text in texts:
+            text.set_color(text_color)
+        for autotext in autotexts:
+            autotext.set_color("black") # Manter contraste dentro das fatias
+
+        ax_pie.set_title("Estoque por Produto", fontsize=10, fontweight='bold', color=text_color)
+        fig_pie.tight_layout()
+        
+        # Tooltip para hover
+        annot = ax_pie.annotate("", xy=(0,0), xytext=(20,20), textcoords="offset points",
+                            bbox=dict(boxstyle="round", fc="white", ec="black", alpha=0.9),
+                            arrowprops=dict(arrowstyle="->"))
+        annot.set_visible(False)
+
+        def hover(event):
+            vis = annot.get_visible()
+            if event.inaxes == ax_pie:
+                for i, wedge in enumerate(wedges):
+                    cont, _ = wedge.contains(event)
+                    if cont:
+                        annot.xy = (event.xdata, event.ydata)
+                        annot.set_text(f"{labels[i]}: {sizes[i]} un")
+                        annot.set_visible(True)
+                        fig_pie.canvas.draw_idle()
+                        return
+            if vis:
+                annot.set_visible(False)
+                fig_pie.canvas.draw_idle()
+        
+        # Container para o gráfico de pizza com borda
+        pie_container = ctk.CTkFrame(self.charts_frame, fg_color="transparent", corner_radius=10,
+                                    border_width=1, border_color=("#7BBDE8", "#3A506B"))
+        pie_container.grid(row=0, column=0, padx=(5, 20), pady=(10, 5))
+
+        canvas_pie = FigureCanvasTkAgg(fig_pie, master=pie_container)
+        canvas_pie.draw()
+        canvas_pie.mpl_connect("motion_notify_event", hover)
+        canvas_pie.get_tk_widget().configure(bg=bg_color, highlightthickness=0)
+        canvas_pie.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+
+        # --- Gráfico de Barras: Gastos por Categoria ---
+        df_gastos = self.db.listar_gastos()
+        
+        if not df_gastos.empty:
+            # Agrupar por categoria e somar valores
+            gastos_por_cat = df_gastos.groupby('categoria')['valor'].sum()
+            cats = gastos_por_cat.index.tolist()
+            vals = gastos_por_cat.values.tolist()
+        else:
+            cats = ['Sem Gastos']
+            vals = [0]
+
+        fig_bar = Figure(figsize=(4.5, 2.8), dpi=100, facecolor=bg_color)
+        ax_bar = fig_bar.add_subplot(111)
+        ax_bar.set_facecolor(bg_color) # Fundo do plot também
+        
+        # Cor das barras adaptativa
+        bar_color = "#7BBDE8" if is_dark else "#0A4174"
+        ax_bar.bar(cats, vals, color=bar_color)
+        
+        ax_bar.set_title("Gastos por Categoria", fontsize=9, fontweight='bold', color=text_color)
+        
+        # Ajustar cores dos eixos
+        ax_bar.tick_params(axis='x', colors=text_color)
+        ax_bar.tick_params(axis='y', colors=text_color)
+        ax_bar.spines['bottom'].set_color(text_color)
+        ax_bar.spines['left'].set_color(text_color)
+        ax_bar.spines['top'].set_visible(False)
+        ax_bar.spines['right'].set_visible(False)
+        
+        # Teto dinâmico baseado nos dados reais
+        if vals and max(vals) > 0:
+            max_val = max(vals)
+            ax_bar.set_ylim(0, max_val * 1.3)  # 30% acima do valor máximo
+        else:
+            ax_bar.set_ylim(0, 100)
+        
+        # Rotacionar labels se houver muitas categorias
+        if len(cats) > 3:
+            ax_bar.tick_params(axis='x', rotation=45)
+        
+        fig_bar.tight_layout()
+        
+        # Container para o gráfico de barras com borda
+        bar_container = ctk.CTkFrame(self.charts_frame, fg_color="transparent", corner_radius=10,
+                                    border_width=1, border_color=("#7BBDE8", "#3A506B"))
+        bar_container.grid(row=0, column=1, padx=(20, 5), pady=(10, 5))
+
+        canvas_bar = FigureCanvasTkAgg(fig_bar, master=bar_container)
+        canvas_bar.draw()
+        canvas_bar.get_tk_widget().configure(bg=bg_color, highlightthickness=0)
+        canvas_bar.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Previsão de Gastos (IA) - DEPOIS dos gráficos
+        self.update_prediction_display()
+
+    def update_prediction_display(self):
+        # Treinar IA (se houver dados)
+        trained = self.ai.train()
+        prediction = self.ai.predict_next_month()
+        
+        # Frame de Previsão com design profissional - ABAIXO DOS GRÁFICOS (row=1)
+        # Frame com estilo mais leve e luminoso
+        pred_frame = ctk.CTkFrame(self.charts_frame, fg_color=("#F0F9FF", "#2B2B2B"), corner_radius=15, 
+                                border_width=1, border_color=("#7BBDE8", "#444444"))
+        pred_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 5))
+        pred_frame.grid_columnconfigure(0, weight=1)
+        
+        # Container com ícone e conteúdo
+        content_frame = ctk.CTkFrame(pred_frame, fg_color="transparent")
+        content_frame.pack(fill="both", expand=True, padx=15, pady=10)
+        
+        # Ícone + Título
+        header_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+        header_frame.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(header_frame, text="", font=ctk.CTkFont(family="Aileron", size=24)).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(header_frame, text="Previsão IA - Gastos Próximo Mês", font=ctk.CTkFont(family="Aileron", size=15, weight="bold"), text_color=("#001D39", "white")).pack(side="left")
+        
+        # Separador
+        sep_frame = ctk.CTkFrame(content_frame, fg_color=("#0A4174", "#4da6ff"), height=2)
+        sep_frame.pack(fill="x", pady=(0, 15))
+        
+        # Conteúdo
+        if trained:
+            # Valor com destaque
+            valor_frame = ctk.CTkFrame(content_frame, fg_color=("#E8F5FF", "#3A3A3A"), corner_radius=10)
+            valor_frame.pack(fill="x", pady=(0, 10))
+            
+            ctk.CTkLabel(valor_frame, text=f"R$ {prediction:.2f}".replace('.', ','), 
+                        font=ctk.CTkFont(family="Aileron", size=28, weight="bold"), text_color=("#001D39", "#4da6ff")).pack(pady=15)
+            
+            # Descrição
+            ctk.CTkLabel(content_frame, text="Baseado em análise de gastos históricos e tendências", 
+                        font=ctk.CTkFont(family="Aileron", size=11), text_color=("#666", "#CCCCCC")).pack(pady=(0, 5))
+            ctk.CTkLabel(content_frame, text="A IA está preparada e pronta para orientar suas decisões financeiras", 
+                        font=ctk.CTkFont(family="Aileron", size=10), text_color=("#999", "#AAAAAA")).pack()
+        else:
+            # Sem dados
+            ctk.CTkLabel(content_frame, text="Dados Insuficientes", 
+                        font=ctk.CTkFont(family="Aileron", size=14, weight="bold"), text_color="#FF6B6B").pack(pady=(0, 10))
+            ctk.CTkLabel(content_frame, text="Adicione gastos no menu 'GASTOS' para que a IA possa fazer previsões precisas.", 
+                        font=ctk.CTkFont(family="Aileron", size=11), text_color=("#555", "#CCCCCC")).pack(pady=(0, 5))
+            ctk.CTkLabel(content_frame, text="Quanto mais dados, melhor a previsão!", 
+                        font=ctk.CTkFont(family="Aileron", size=10), text_color=("#999", "#AAAAAA")).pack()
+
+
+    def _ask_admin_login(self, on_success):
+        """Exibe dialog de login admin. Chama on_success() se credenciais corretas."""
+        login_win = ctk.CTkToplevel(self)
+        login_win.title("Acesso Restrito")
+        login_win.geometry("370x310")
+        login_win.attributes("-topmost", True)
+        login_win.resizable(False, False)
+
+        ctk.CTkLabel(login_win, text="🔒 Área Administrativa",
+                     font=ctk.CTkFont(family="Aileron", size=16, weight="bold"),
+                     text_color=("#001D39", "white")).pack(pady=(20, 5))
+        ctk.CTkLabel(login_win, text="Insira suas credenciais para continuar.",
+                     font=("Aileron", 11), text_color=("gray40", "gray70")).pack(pady=(0, 15))
+
+        ctk.CTkLabel(login_win, text="Usuário:", font=("Aileron", 12, "bold")).pack(anchor="w", padx=30)
+        entry_user = ctk.CTkEntry(login_win, height=35, placeholder_text="Usuário")
+        entry_user.pack(fill="x", padx=30, pady=(2, 10))
+
+        ctk.CTkLabel(login_win, text="Senha:", font=("Aileron", 12, "bold")).pack(anchor="w", padx=30)
+        entry_pass = ctk.CTkEntry(login_win, height=35, placeholder_text="Senha", show="*")
+        entry_pass.pack(fill="x", padx=30, pady=(2, 10))
+
+        lbl_erro = ctk.CTkLabel(login_win, text="", font=("Aileron", 11), text_color="#FF6B6B")
+        lbl_erro.pack()
+
+        def _tentar_login():
+            if verify_admin(entry_user.get().strip(), entry_pass.get()):
+                login_win.destroy()
+                on_success()
+            else:
+                lbl_erro.configure(text="Usuário ou senha incorretos!")
+
+        ctk.CTkButton(login_win, text="Entrar", command=_tentar_login,
+                      fg_color="#0A4174", hover_color="#062F56", text_color="white",
+                      font=("Aileron", 13, "bold"), height=40).pack(fill="x", padx=30, pady=(5, 10))
+
+        entry_user.focus_set()
+        entry_pass.bind("<Return>", lambda e: _tentar_login())
+        login_win.grab_set()
+
+    def sidebar_event(self, btn_text):
+        if not self._tem_permissao(btn_text):
+            messagebox.showwarning("Acesso Negado", f"Seu perfil não tem permissão para '{btn_text}'.")
+            return
+        if btn_text == "GASTOS":
+            self.open_gastos_dialog()
+        elif btn_text == "KITS":
+            self.open_kit_manager()
+        elif btn_text == "CHAT IA":
+            self.open_chat_ai()
+        elif btn_text == "SALDO":
+            self.open_saldo_dialog()
+        elif btn_text == "CAIXA":
+            self.open_caixa_dialog()
+        elif btn_text == "CATEGORIAS":
+            self.open_categorias_manager()
+        elif btn_text == "FORNECEDORES":
+            self.open_generic_manager("Fornecedores", self.db.listar_fornecedores, self.db.adicionar_fornecedor, self.db.remover_fornecedor, ["Nome", "Contato", "Produto Fornecido"])
+        elif btn_text == "CLIENTES":
+            self.open_clientes_manager()
+        elif btn_text == "ANOTA TUDO":
+            self.open_anota_tudo_dialog()
+        elif btn_text == "VENDEDORES":
+            self.open_vendedores_dialog()
+        elif btn_text == "CONFIG":
+            self._ask_admin_login(self.open_config_dialog)
+        elif btn_text == "INSUMOS":
+            self.open_insumos_manager()
+        elif btn_text == "PRODUÇÃO":
+            self.open_producao_dialog()
+        elif btn_text == "TROCAS":
+            self.open_trocas_dialog()
+        elif btn_text == "REPOSIÇÃO":
+            self.open_lista_reposicao()
+        elif btn_text == "MESAS":
+            self.open_mesas_manager()
+        elif btn_text == "COMANDAS":
+            self.open_comandas_dialog()
+        elif btn_text == "COZINHA":
+            self.open_cozinha_dialog()
+        elif btn_text == "CONTAS PAGAR":
+            self.open_contas_pagar_dialog()
+        elif btn_text == "ETIQUETAS":
+            self.open_etiquetas_dialog()
+
+    def topbar_event(self, btn_text):
+        if not self._tem_permissao(btn_text):
+            messagebox.showwarning("Acesso Negado", f"Seu perfil não tem permissão para '{btn_text}'.")
+            return
+        if btn_text == "ADICIONAR":
+            self.open_add_product_dialog()
+        elif btn_text == "VENDER":
+            self.open_sell_product_dialog()
+        elif btn_text == "SERVIÇO":
+            self.open_servico_dialog()
+        elif btn_text == "LISTA":
+            self.open_lista_dialog()
+        elif btn_text == "RELATORIO":
+            self._ask_admin_login(self.open_report_dialog)
+        elif btn_text == "DRE":
+            self._ask_admin_login(self.open_dre_dialog)
+    
+    def open_gastos_dialog(self):
+        self.open_gasto_manager()
+
+    def open_generic_manager(self, title, list_func, add_func, remove_func, field_names):
+        window = ctk.CTkToplevel(self)
+        window.title(f"Gestão de {title}")
+        window.geometry("650x600")
+        window.attributes("-topmost", True)
+
+        # Frame principal
+        main_frame = ctk.CTkFrame(window, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        # Título
+        title_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        title_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(title_frame, text=f"{title}", font=ctk.CTkFont(family="Aileron", size=18, weight="bold"), text_color=("#001D39", "white")).pack()
+        
+        # Adição de itens
+        add_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        add_frame.pack(fill="x", pady=(0, 20))
+        
+        ctk.CTkLabel(add_frame, text=f"Adicionar {title}", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 10), padx=15, anchor="w")
+        
+        entries = []
+        for field in field_names:
+            ctk.CTkLabel(add_frame, text=f"{field}:", font=ctk.CTkFont(family="Aileron", weight="bold", size=11), text_color=("#001D39", "white")).pack(pady=(5, 2), padx=15, anchor="w")
+            entry = ctk.CTkEntry(add_frame, placeholder_text=f"Digite {field.lower()}...", height=35)
+            entry.pack(pady=2, padx=15, fill="x")
+            entries.append(entry)
+            
+        def add_item():
+            values = [e.get().strip() for e in entries]
+            if all(values):
+                add_func(*values)
+                messagebox.showinfo("Sucesso", "Item adicionado!", parent=window)
+                refresh_list()
+                for e in entries: e.delete(0, "end")
+            else:
+                messagebox.showerror("Erro", "Preencha todos os campos.", parent=window)
+
+        btn_frame = ctk.CTkFrame(add_frame, fg_color="transparent")
+        btn_frame.pack(pady=15, padx=15, fill="x")
+        ctk.CTkButton(btn_frame, text="Adicionar", command=add_item, height=35, 
+                    fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F",
+                    font=ctk.CTkFont(family="Aileron", weight="bold")).pack(fill="x")
+
+        # Lista de itens
+        list_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        list_card.pack(fill="both", expand=True)
+        
+        ctk.CTkLabel(list_card, text=f"Lista de {title}", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 10), padx=15, anchor="w")
+        
+        list_frame = ctk.CTkScrollableFrame(list_card, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        list_frame.pack(pady=10, padx=15, fill="both", expand=True)
+
+        def refresh_list():
+            for widget in list_frame.winfo_children():
+                widget.destroy()
+            
+            df = list_func()
+            if df.empty:
+                ctk.CTkLabel(list_frame, text="Nenhum item encontrado.", text_color=("#999999", "#AAAAAA")).pack(pady=20)
+                return
+
+            for index, row in df.iterrows():
+                item_frame = ctk.CTkFrame(list_frame, fg_color=("white", "#404040"), corner_radius=8)
+                item_frame.pack(pady=5, fill="x", padx=5)
+                
+                # Display values
+                display_text = " - ".join([str(val) for col, val in row.items() if col != 'id'])
+                
+                ctk.CTkLabel(item_frame, text=display_text, anchor="w", text_color=("#333333", "white")).pack(side="left", padx=10, pady=8, expand=True, fill="x")
+                
+                def delete_item(id_val=row['id']):
+                    if messagebox.askyesno("Confirmar", "Remover este item?", parent=window):
+                        remove_func(id_val)
+                        refresh_list()
+
+                ctk.CTkButton(item_frame, text="Deletar", width=30, fg_color="#FF6B6B", hover_color="#FF5252", text_color="white", command=delete_item).pack(side="right", padx=5, pady=5)
+
+        refresh_list()
+
+    def open_categorias_manager(self):
+        """Gerencia categorias, subcategorias e tamanhos."""
+        window = ctk.CTkToplevel(self)
+        window.title("Gerenciar Categorias")
+        window.geometry("750x750")
+        window.attributes("-topmost", True)
+
+        main_frame = ctk.CTkFrame(window, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        ctk.CTkLabel(main_frame, text="Gerenciar Categorias", font=ctk.CTkFont(family="Aileron", size=18, weight="bold"), text_color=("#001D39", "white")).pack(pady=(0, 15))
+
+        # Tabview para separar Produto / Gasto
+        tabview = ctk.CTkTabview(main_frame, width=700, height=650)
+        tabview.pack(fill="both", expand=True)
+
+        for tipo_label, tipo_key in [("Categorias de Produto", "produto"), ("Categorias de Gasto", "gasto")]:
+            tab = tabview.add(tipo_label)
+
+            # --- Adicionar Categoria ---
+            add_frame = ctk.CTkFrame(tab, fg_color=("white", "#2B2B2B"), corner_radius=15)
+            add_frame.pack(fill="x", pady=(0, 10))
+
+            ctk.CTkLabel(add_frame, text="Nova Categoria:", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(10, 5), padx=15, anchor="w")
+            entry_cat = ctk.CTkEntry(add_frame, placeholder_text="Ex: Camisa, Calça, Acessórios...", height=35)
+            entry_cat.pack(pady=5, padx=15, fill="x")
+
+            # --- Lista Hierárquica ---
+            list_frame = ctk.CTkScrollableFrame(tab, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+            list_frame.pack(fill="both", expand=True)
+
+            def refresh_cats(lf=list_frame, tk=tipo_key):
+                for w in lf.winfo_children():
+                    w.destroy()
+                cats = self.db.listar_categorias(tk)
+                if not cats:
+                    ctk.CTkLabel(lf, text="Nenhuma categoria cadastrada.", text_color=("#999999", "#AAAAAA")).pack(pady=20)
+                    return
+                for cat_name in cats:
+                    # --- Card da Categoria ---
+                    cat_card = ctk.CTkFrame(lf, fg_color=("white", "#404040"), corner_radius=10, border_width=1, border_color=("#DDDDDD", "#555555"))
+                    cat_card.pack(pady=4, fill="x", padx=5)
+
+                    # Header da categoria
+                    cat_header = ctk.CTkFrame(cat_card, fg_color="transparent")
+                    cat_header.pack(fill="x", padx=10, pady=(8, 4))
+                    ctk.CTkLabel(cat_header, text=f"📁 {cat_name}", anchor="w", text_color=("#001D39", "white"), font=ctk.CTkFont(family="Aileron", size=13, weight="bold")).pack(side="left", expand=True, fill="x")
+
+                    def del_cat(n=cat_name, t=tk, r=refresh_cats):
+                        if messagebox.askyesno("Confirmar", f"Remover categoria '{n}' e todas suas subcategorias?", parent=window):
+                            self.db.remover_categoria(n, t)
+                            r()
+                    ctk.CTkButton(cat_header, text="✕", width=30, fg_color="#FF6B6B", hover_color="#FF5252", text_color="white", command=del_cat).pack(side="right")
+
+                    # Subcategorias dentro da categoria
+                    subcats = self.db.listar_subcategorias(cat_name, tk)
+                    sub_container = ctk.CTkFrame(cat_card, fg_color="transparent")
+                    sub_container.pack(fill="x", padx=20, pady=(0, 4))
+
+                    for sub_name in subcats:
+                        sub_frame = ctk.CTkFrame(sub_container, fg_color=("#EBF5FB", "#3A3A3A"), corner_radius=8)
+                        sub_frame.pack(fill="x", pady=2)
+
+                        sub_header = ctk.CTkFrame(sub_frame, fg_color="transparent")
+                        sub_header.pack(fill="x", padx=8, pady=(4, 2))
+                        ctk.CTkLabel(sub_header, text=f"  ↳ {sub_name}", anchor="w", text_color=("#333333", "#CCCCCC"), font=ctk.CTkFont(family="Aileron", size=12)).pack(side="left", expand=True, fill="x")
+
+                        def del_sub(cn=cat_name, sn=sub_name, t=tk, r=refresh_cats):
+                            if messagebox.askyesno("Confirmar", f"Remover subcategoria '{sn}'?", parent=window):
+                                self.db.remover_subcategoria(cn, sn, t)
+                                r()
+                        ctk.CTkButton(sub_header, text="✕", width=25, height=22, fg_color="#FF9999", hover_color="#FF6666", text_color="white", command=del_sub, font=ctk.CTkFont(size=10)).pack(side="right")
+
+                        # Sub-subcategorias dentro da subcategoria
+                        sub_subs = self.db.listar_sub_subcategorias(cat_name, sub_name, tk)
+                        if sub_subs:
+                            ss_frame = ctk.CTkFrame(sub_frame, fg_color="transparent")
+                            ss_frame.pack(fill="x", padx=25, pady=(0, 4))
+                            for ss_name in sub_subs:
+                                ss_item = ctk.CTkFrame(ss_frame, fg_color=("#D6EAF8", "#2A3A4A"), corner_radius=6)
+                                ss_item.pack(fill="x", pady=1, padx=2)
+                                ctk.CTkLabel(ss_item, text=f"    ↳ {ss_name}", font=ctk.CTkFont(size=11), text_color=("#444", "#CCC")).pack(side="left", padx=6, pady=2)
+
+                                def del_ss(cn=cat_name, sn=sub_name, ssn=ss_name, t=tk, r=refresh_cats):
+                                    self.db.remover_sub_subcategoria(cn, sn, ssn, t)
+                                    r()
+                                ctk.CTkButton(ss_item, text="✕", width=18, height=18, fg_color="transparent", hover_color="#FF9999", text_color="#999", command=del_ss, font=ctk.CTkFont(size=9)).pack(side="right")
+
+                        # Botão adicionar sub-subcategoria
+                        def add_ss_dlg(cn=cat_name, sn=sub_name, t=tk, r=refresh_cats):
+                            ss_str = ctk.CTkInputDialog(text=f"Nova sub-subcategoria em '{sn}':\n(Ex: Estampada, Lisa, Bordada...)", title="Nova Sub-Subcategoria").get_input()
+                            if ss_str and ss_str.strip():
+                                if self.db.adicionar_sub_subcategoria(cn, sn, ss_str.strip(), t):
+                                    r()
+                                else:
+                                    messagebox.showwarning("Aviso", "Sub-subcategoria já existe.", parent=window)
+                        ctk.CTkButton(sub_frame, text="+ Sub-Subcat", width=100, height=22, fg_color="#85C1E9", hover_color="#5DADE2", text_color="#001D39", font=ctk.CTkFont(size=10), command=add_ss_dlg).pack(padx=25, pady=(0, 2), anchor="w")
+
+                        # Tamanhos dentro da subcategoria
+                        tamanhos = self.db.listar_tamanhos(cat_name, sub_name, tk)
+                        if tamanhos:
+                            tam_frame = ctk.CTkFrame(sub_frame, fg_color="transparent")
+                            tam_frame.pack(fill="x", padx=25, pady=(0, 4))
+                            for tam in tamanhos:
+                                t_item = ctk.CTkFrame(tam_frame, fg_color=("#D5F5E3", "#2D4A3E"), corner_radius=6)
+                                t_item.pack(side="left", padx=2, pady=2)
+                                ctk.CTkLabel(t_item, text=f" {tam} ", font=ctk.CTkFont(size=11), text_color=("#333", "#DDD")).pack(side="left", padx=4, pady=2)
+
+                                def del_tam(cn=cat_name, sn=sub_name, tn=tam, t=tk, r=refresh_cats):
+                                    self.db.remover_tamanho(cn, sn, tn, t)
+                                    r()
+                                ctk.CTkButton(t_item, text="✕", width=18, height=18, fg_color="transparent", hover_color="#FF9999", text_color="#999", command=del_tam, font=ctk.CTkFont(size=9)).pack(side="left")
+
+                        # Botão adicionar tamanho
+                        def add_tam_dlg(cn=cat_name, sn=sub_name, t=tk, r=refresh_cats):
+                            tam_str = ctk.CTkInputDialog(text=f"Tamanho para '{sn}':\n(Ex: P, M, G, GG, 38, 40...)", title="Novo Tamanho").get_input()
+                            if tam_str and tam_str.strip():
+                                self.db.adicionar_tamanho(cn, sn, tam_str.strip().upper(), t)
+                                r()
+                        ctk.CTkButton(sub_frame, text="+ Tamanho", width=90, height=22, fg_color="#5DADE2", hover_color="#3498DB", text_color="white", font=ctk.CTkFont(size=10), command=add_tam_dlg).pack(padx=25, pady=(0, 6), anchor="w")
+
+                    # Botão adicionar subcategoria
+                    def add_sub_dlg(cn=cat_name, t=tk, r=refresh_cats):
+                        sub_str = ctk.CTkInputDialog(text=f"Nova subcategoria em '{cn}':\n(Ex: Malha, Linho, Jeans...)", title="Nova Subcategoria").get_input()
+                        if sub_str and sub_str.strip():
+                            if self.db.adicionar_subcategoria(cn, sub_str.strip(), t):
+                                r()
+                            else:
+                                messagebox.showwarning("Aviso", "Subcategoria já existe.", parent=window)
+                    ctk.CTkButton(cat_card, text="+ Subcategoria", width=130, height=26, fg_color="#0A4174", hover_color="#062F56", text_color="white", font=ctk.CTkFont(size=11, weight="bold"), command=add_sub_dlg).pack(padx=10, pady=(0, 8), anchor="w")
+
+            def add_cat(entry=entry_cat, tk=tipo_key, rf=refresh_cats):
+                nome = entry.get().strip()
+                if not nome:
+                    messagebox.showerror("Erro", "Digite um nome para a categoria.", parent=window)
+                    return
+                if self.db.adicionar_categoria(nome, tk):
+                    messagebox.showinfo("Sucesso", f"Categoria '{nome}' adicionada!", parent=window)
+                    entry.delete(0, "end")
+                    rf()
+                else:
+                    messagebox.showwarning("Aviso", f"Categoria '{nome}' já existe.", parent=window)
+
+            ctk.CTkButton(add_frame, text="Adicionar Categoria", command=add_cat, height=35,
+                        fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F",
+                        font=ctk.CTkFont(family="Aileron", weight="bold")).pack(pady=(5, 10), padx=15, fill="x")
+
+            refresh_cats()
+
+    def open_config_dialog(self):
+        """Abre janela de configuração geral do sistema com abas."""
+        cfg = get_printer_config()
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Configurações")
+        dialog.geometry("650x620")
+        dialog.attributes("-topmost", True)
+
+        tabview = ctk.CTkTabview(dialog, width=610, height=570)
+        tabview.pack(padx=15, pady=15, fill="both", expand=True)
+
+        # ====== ABA IMPRESSORA ======
+        tab_printer = tabview.add("Impressora")
+
+        frame = ctk.CTkFrame(tab_printer, fg_color="transparent")
+        frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        enabled_var = ctk.BooleanVar(value=cfg.get("enabled", False))
+        ctk.CTkCheckBox(frame, text="Usar impressora física", variable=enabled_var).pack(anchor="w", pady=5)
+
+        type_var = ctk.StringVar(value=cfg.get("type", "text"))
+        ctk.CTkLabel(frame, text="Tipo de Impressora:").pack(anchor="w", pady=(10,2))
+        type_combo = ctk.CTkComboBox(frame, values=["text", "windows", "escpos"], variable=type_var, state="readonly")
+        type_combo.pack(pady=5, fill="x")
+
+        # Seleção de impressora Windows instalada
+        printer_name_var = ctk.StringVar(value=cfg.get("settings", {}).get("printer_name", ""))
+        lbl_printer_name = ctk.CTkLabel(frame, text="Impressora Windows:")
+        combo_printer_name = ctk.CTkComboBox(frame, variable=printer_name_var, values=[""], state="readonly")
+
+        try:
+            from printer import WindowsRawPrinter
+            impressoras = WindowsRawPrinter.listar_impressoras()
+            if impressoras:
+                combo_printer_name.configure(values=impressoras)
+                if not printer_name_var.get() and impressoras:
+                    printer_name_var.set(impressoras[0])
+        except Exception:
+            impressoras = []
+
+        interface_var = ctk.StringVar(value=cfg.get("interface", "file"))
+        lbl_interface = ctk.CTkLabel(frame, text="Interface:")
+        combo_interface = ctk.CTkComboBox(frame, values=["file", "usb", "network", "serial"], variable=interface_var, state="readonly")
+
+        lbl_params = ctk.CTkLabel(frame, text="Parâmetros (JSON):")
+        entry_params = ctk.CTkEntry(frame, width=300)
+        entry_params.insert(0, json.dumps(cfg.get("settings", {})))
+
+        def atualizar_campos_tipo(*args):
+            tipo = type_var.get()
+            # Esconder todos os campos opcionais
+            lbl_printer_name.pack_forget()
+            combo_printer_name.pack_forget()
+            lbl_interface.pack_forget()
+            combo_interface.pack_forget()
+            lbl_params.pack_forget()
+            entry_params.pack_forget()
+            # Mostrar campos relevantes
+            if tipo == "windows":
+                lbl_printer_name.pack(anchor="w", pady=(10,2))
+                combo_printer_name.pack(pady=5, fill="x")
+            elif tipo == "escpos":
+                lbl_interface.pack(anchor="w", pady=(10,2))
+                combo_interface.pack(pady=5, fill="x")
+                lbl_params.pack(anchor="w", pady=(10,2))
+                entry_params.pack(pady=5, fill="x")
+
+        type_var.trace_add("write", atualizar_campos_tipo)
+        atualizar_campos_tipo()
+
+        def save_config_action():
+            tipo = type_var.get()
+            newcfg = {
+                "enabled": enabled_var.get(),
+                "type": tipo,
+                "interface": interface_var.get() if tipo == "escpos" else "file",
+                "settings": {}
+            }
+            if tipo == "windows":
+                newcfg["settings"]["printer_name"] = printer_name_var.get()
+            elif tipo == "escpos":
+                try:
+                    parsed = json.loads(entry_params.get())
+                    if isinstance(parsed, dict):
+                        newcfg["settings"] = parsed
+                except Exception:
+                    pass
+            set_printer_config(newcfg)
+            messagebox.showinfo("Configurações", "Configurações salvas!", parent=dialog)
+
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=(15,0))
+        ctk.CTkButton(btn_frame, text="Salvar", command=save_config_action, fg_color="#7BBDE8", text_color="#001D39").pack(side="left", expand=True, fill="x", padx=5)
+
+        def test_printer():
+            printer = get_printer()
+            try:
+                printer.print_text("== TESTE DE IMPRESSÃO ==\n")
+                messagebox.showinfo("Teste", "Envio concluído (ou mensagem registrada).", parent=dialog)
+            except Exception as e:
+                messagebox.showerror("Teste", f"Falha: {e}", parent=dialog)
+
+        ctk.CTkButton(btn_frame, text="Testar", command=test_printer, fg_color="#AED6F1", text_color="#001D39").pack(side="left", expand=True, fill="x", padx=5)
+
+        # ====== ABA BACKUP ======
+        tab_backup = tabview.add("Backup")
+        backup_frame = ctk.CTkFrame(tab_backup, fg_color="transparent")
+        backup_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        ctk.CTkLabel(backup_frame, text="Gerenciamento de Backup", font=ctk.CTkFont(family="Aileron", size=16, weight="bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 15))
+
+        def criar_backup_manual():
+            ok, result = self.db.criar_backup()
+            if ok:
+                messagebox.showinfo("Backup", f"Backup criado com sucesso!\n{result}", parent=dialog)
+                atualizar_lista_backups()
+            else:
+                messagebox.showerror("Erro", f"Erro ao criar backup: {result}", parent=dialog)
+
+        ctk.CTkButton(backup_frame, text="📦 Criar Backup Agora", command=criar_backup_manual,
+                        fg_color="#28a745", hover_color="#218838", text_color="white",
+                        font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(0, 15))
+
+        ctk.CTkLabel(backup_frame, text="Backups Disponíveis:", font=("Aileron", 12, "bold"),
+                    text_color=("#001D39", "white")).pack(anchor="w", pady=(0, 5))
+
+        backup_list_frame = ctk.CTkScrollableFrame(backup_frame, height=180, fg_color=("white", "#2B2B2B"))
+        backup_list_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        def atualizar_lista_backups():
+            for w in backup_list_frame.winfo_children():
+                w.destroy()
+            backups = self.db.listar_backups()
+            if not backups:
+                ctk.CTkLabel(backup_list_frame, text="Nenhum backup encontrado.", text_color="gray").pack(pady=20)
+                return
+            for bk in backups:
+                row = ctk.CTkFrame(backup_list_frame, fg_color="transparent")
+                row.pack(fill="x", pady=2, padx=5)
+                ctk.CTkLabel(row, text=f"📁 {bk['data']}  ({bk['tamanho']})",
+                            font=("Aileron", 11), anchor="w").pack(side="left", fill="x", expand=True)
+                ctk.CTkButton(row, text="Restaurar", width=80, height=28,
+                                fg_color="#E67E22", hover_color="#D35400", text_color="white",
+                                font=("Aileron", 10, "bold"),
+                                command=lambda p=bk['path']: restaurar_backup(p)).pack(side="right", padx=2)
+
+        def restaurar_backup(path):
+            if messagebox.askyesno("Restaurar Backup",
+                    "ATENÇÃO: Isso substituirá TODOS os dados atuais pelo backup selecionado.\n\n"
+                    "Um backup de segurança será criado antes.\n\nDeseja continuar?", parent=dialog):
+                ok, msg = self.db.restaurar_backup(path)
+                if ok:
+                    messagebox.showinfo("Sucesso", msg, parent=dialog)
+                else:
+                    messagebox.showerror("Erro", msg, parent=dialog)
+
+        atualizar_lista_backups()
+
+        # ====== ABA EXPORTAR ======
+        tab_reports = tabview.add("Exportar")
+        report_frame = ctk.CTkFrame(tab_reports, fg_color="transparent")
+        report_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        ctk.CTkLabel(report_frame, text="Exportar Relatórios", font=ctk.CTkFont(family="Aileron", size=16, weight="bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 15))
+
+        ctk.CTkLabel(report_frame, text="Tipo:", font=("Aileron", 12, "bold")).pack(anchor="w", pady=(0, 3))
+        tipo_report_var = ctk.StringVar(value="vendas")
+        ctk.CTkComboBox(report_frame, values=["vendas", "estoque", "financeiro"], variable=tipo_report_var,
+                        state="readonly", height=35).pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(report_frame, text="Período:", font=("Aileron", 12, "bold")).pack(anchor="w", pady=(0, 3))
+        periodo_report_var = ctk.StringVar(value="mes")
+        ctk.CTkComboBox(report_frame, values=["hoje", "semana", "mes", "ano", "todos"], variable=periodo_report_var,
+                        state="readonly", height=35).pack(fill="x", pady=(0, 15))
+
+        def exportar_relatorio():
+            tipo = tipo_report_var.get()
+            periodo = periodo_report_var.get()
+            ok, result = self.db.exportar_relatorio_pdf(tipo, periodo)
+            if ok:
+                messagebox.showinfo("Exportado", f"Relatório salvo em:\n{result}", parent=dialog)
+                try:
+                    os.startfile(result)
+                except Exception:
+                    pass
+            else:
+                messagebox.showerror("Erro", result, parent=dialog)
+
+        ctk.CTkButton(report_frame, text="📊 Exportar Relatório", command=exportar_relatorio,
+                        fg_color="#0A4174", hover_color="#062F56", text_color="white",
+                        font=("Aileron", 13, "bold"), height=40).pack(fill="x")
+
+        # ====== ABA NOTA PERSONALIZADA ======
+        tab_nota = tabview.add("Nota/Recibo")
+        nota_frame = ctk.CTkScrollableFrame(tab_nota, fg_color="transparent")
+        nota_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        ctk.CTkLabel(nota_frame, text="Personalizar Nota/Recibo", font=ctk.CTkFont(family="Aileron", size=16, weight="bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 15))
+
+        nota_cfg = self.db.get_config_nota()
+
+        nota_entries = {}
+        nota_fields = [
+            ("Nome da Empresa", "empresa_nome"),
+            ("E-mail", "empresa_email"),
+            ("Telefone", "empresa_telefone"),
+            ("Endereço", "empresa_endereco"),
+            ("CNPJ/CPF", "empresa_cnpj"),
+            ("Mensagem de Rodapé", "mensagem_rodape"),
+        ]
+        for label, key in nota_fields:
+            ctk.CTkLabel(nota_frame, text=f"{label}:", font=("Aileron", 11, "bold")).pack(anchor="w", pady=(8, 2))
+            e = ctk.CTkEntry(nota_frame, height=35)
+            e.insert(0, nota_cfg.get(key, ''))
+            e.pack(fill="x", pady=(0, 5))
+            nota_entries[key] = e
+
+        # Logo/Foto
+        ctk.CTkLabel(nota_frame, text="Logo da Empresa:", font=("Aileron", 11, "bold")).pack(anchor="w", pady=(8, 2))
+        lbl_logo = ctk.CTkLabel(nota_frame, text=nota_cfg.get('empresa_logo', '') or "Nenhum logo selecionado",
+                                font=("Aileron", 10, "italic"), text_color="gray")
+        lbl_logo.pack(anchor="w", padx=5)
+
+        _temp_logo_path = [nota_cfg.get('empresa_logo', '')]
+
+        def pick_logo():
+            dialog.attributes("-topmost", False)
+            p = filedialog.askopenfilename(filetypes=[("Imagens", "*.png *.jpg *.jpeg")])
+            dialog.attributes("-topmost", True)
+            if p:
+                # Copiar para appdata
+                img_dir = os.path.join(self.db.data_dir, "product_images")
+                os.makedirs(img_dir, exist_ok=True)
+                ext = os.path.splitext(p)[1]
+                logo_name = f"logo_empresa{ext}"
+                try:
+                    shutil.copy2(p, os.path.join(img_dir, logo_name))
+                    _temp_logo_path[0] = logo_name
+                    lbl_logo.configure(text=logo_name)
+                except Exception as e:
+                    logger.warning("Erro ao copiar logo: %s", e)
+
+        ctk.CTkButton(nota_frame, text="Selecionar Logo", command=pick_logo,
+                      fg_color="#5DADE2", text_color="#001D39", height=30).pack(fill="x", pady=(5, 10))
+
+        def salvar_nota_config():
+            new_cfg = {}
+            for key, entry in nota_entries.items():
+                new_cfg[key] = entry.get().strip()
+            new_cfg['empresa_logo'] = _temp_logo_path[0]
+            self.db.salvar_config_nota(new_cfg)
+            messagebox.showinfo("Sucesso", "Configuração da nota salva!", parent=dialog)
+
+        ctk.CTkButton(nota_frame, text="Salvar Configurações da Nota", command=salvar_nota_config,
+                      fg_color="#28a745", hover_color="#218838", text_color="white",
+                      font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(10, 5))
+
+        def previsualizar_nota():
+            """Gera uma nota de exemplo com as configurações atuais e exibe como imagem."""
+            preview_cfg = {}
+            for key, entry in nota_entries.items():
+                preview_cfg[key] = entry.get().strip()
+            preview_cfg['empresa_logo'] = _temp_logo_path[0]
+
+            itens_exemplo = [
+                {'nome': 'Produto Exemplo A', 'qtd': 2, 'preco': 49.90},
+                {'nome': 'Produto Exemplo B', 'qtd': 1, 'preco': 29.90},
+            ]
+            cliente_exemplo = {'nome': 'Cliente Teste', 'contato': '(11) 99999-0000'}
+            _, text_content, _ = invoice_generator.gerar_nota_txt(
+                itens_exemplo, cliente_exemplo, 119.70,
+                id_venda='PREVIEW', desconto=10.00,
+                abrir_arquivo=False, config_nota=preview_cfg
+            )
+            if not text_content:
+                messagebox.showwarning("Aviso", "Erro ao gerar pré-visualização.", parent=dialog)
+                return
+
+            # Renderizar como imagem usando PIL
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                margin = 12
+                receipt_width = 360
+                font_size = 14
+                title_font_size = 20
+                line_spacing = 2
+
+                try:
+                    font = ImageFont.truetype("consola.ttf", font_size)
+                    title_font = ImageFont.truetype("consola.ttf", title_font_size)
+                except Exception:
+                    try:
+                        font = ImageFont.truetype("cour.ttf", font_size)
+                        title_font = ImageFont.truetype("cour.ttf", title_font_size)
+                    except Exception:
+                        font = ImageFont.load_default()
+                        title_font = font
+
+                lines = text_content.split('\n')
+                dummy = Image.new('RGB', (1, 1))
+                dd = ImageDraw.Draw(dummy)
+                bbox = dd.textbbox((0, 0), 'Ag', font=font)
+                line_h = bbox[3] - bbox[1] + line_spacing
+                bbox_t = dd.textbbox((0, 0), 'Ag', font=title_font)
+                title_h = bbox_t[3] - bbox_t[1] + line_spacing
+
+                # Verificar se há logo
+                logo_img = None
+                logo_h = 0
+                logo_file = _temp_logo_path[0]
+                if logo_file:
+                    logo_full = os.path.join(self.db.data_dir, "product_images", logo_file)
+                    if os.path.isfile(logo_full):
+                        logo_img = Image.open(logo_full)
+                        logo_img.thumbnail((receipt_width - 2 * margin, 80), Image.LANCZOS)
+                        logo_h = logo_img.size[1]
+
+                title_line = None
+                text_lines = []
+                found = False
+                for l in lines:
+                    s = l.strip()
+                    if not found and s:
+                        title_line = s
+                        found = True
+                    else:
+                        text_lines.append(l)
+                while text_lines and not text_lines[-1].strip():
+                    text_lines.pop()
+
+                logo_gap = 8 if logo_img else 0
+                text_height = len(text_lines) * line_h + (title_h if title_line else 0)
+                total_h = margin + logo_h + logo_gap + text_height + margin
+
+                img = Image.new('RGB', (receipt_width, total_h), 'white')
+                draw = ImageDraw.Draw(img)
+                y = margin
+
+                if logo_img:
+                    lx = (receipt_width - logo_img.size[0]) // 2
+                    if logo_img.mode == 'RGBA':
+                        img.paste(logo_img, (lx, y), logo_img)
+                    else:
+                        img.paste(logo_img, (lx, y))
+                    y += logo_h + logo_gap
+
+                if title_line:
+                    tb = draw.textbbox((0, 0), title_line, font=title_font)
+                    tw = tb[2] - tb[0]
+                    draw.text(((receipt_width - tw) // 2, y), title_line, fill='black', font=title_font)
+                    y += title_h + 2
+
+                for line in text_lines:
+                    stripped = line.strip()
+                    if stripped and all(c == '-' for c in stripped):
+                        tb = draw.textbbox((0, 0), stripped, font=font)
+                        tw = tb[2] - tb[0]
+                        draw.text(((receipt_width - tw) // 2, y), stripped, fill='black', font=font)
+                    else:
+                        draw.text((margin, y), line, fill='black', font=font)
+                    y += line_h
+
+                img = img.crop((0, 0, receipt_width, y + margin))
+
+                # Salvar e abrir
+                import tempfile
+                tmp = os.path.join(tempfile.gettempdir(), "estokeaocubo_preview.png")
+                img.save(tmp, 'PNG')
+                if os.name == 'nt':
+                    os.startfile(tmp)
+                else:
+                    opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+                    subprocess.call([opener, tmp])
+            except ImportError:
+                messagebox.showwarning("Aviso",
+                    "Biblioteca Pillow não instalada.\nInstale com: pip install Pillow",
+                    parent=dialog)
+            except Exception as e:
+                logger.warning("Erro na pré-visualização: %s", e)
+                messagebox.showwarning("Aviso", f"Erro ao gerar pré-visualização:\n{e}", parent=dialog)
+
+        ctk.CTkButton(nota_frame, text="👁 Pré-visualizar Nota", command=previsualizar_nota,
+                      fg_color="#5DADE2", hover_color="#3498DB", text_color="#001D39",
+                      font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(5, 5))
+
+        # ====== ABA CALCULADORA DE LUCRO ======
+        tab_calc = tabview.add("Calc. Lucro")
+        calc_frame = ctk.CTkFrame(tab_calc, fg_color="transparent")
+        calc_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        # ====== ABA TIPO DE NEGÓCIO ======
+        tab_btype = tabview.add("Tipo Negócio")
+        btype_frame = ctk.CTkFrame(tab_btype, fg_color="transparent")
+        btype_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        ctk.CTkLabel(btype_frame, text="Tipo de Negócio",
+                     font=ctk.CTkFont(family="Aileron", size=16, weight="bold"),
+                     text_color=("#001D39", "white")).pack(pady=(0, 5))
+        ctk.CTkLabel(btype_frame, text="Altere o tipo de negócio para personalizar campos e funcionalidades.",
+                     font=("Aileron", 11), text_color=("gray40", "gray70")).pack(pady=(0, 15))
+
+        btype_labels = {
+            "artesanato": "🎨 Artesanato",
+            "padaria_acougue": "🥖 Padaria / Açougue",
+            "loja_roupa": "👗 Loja de Roupas",
+            "restaurante": "🍽️ Restaurante",
+            "variados": "🏪 Variados",
+        }
+        current_btype = self.business_type or "variados"
+        btype_var = ctk.StringVar(value=current_btype)
+
+        for key, label in btype_labels.items():
+            ctk.CTkRadioButton(btype_frame, text=label, variable=btype_var, value=key,
+                               font=("Aileron", 13), text_color=("#001D39", "white")).pack(anchor="w", pady=5, padx=10)
+
+        def _save_btype():
+            new_type = btype_var.get()
+            set_business_type(new_type)
+            self.business_type = new_type
+            messagebox.showinfo("Tipo de Negócio",
+                                f"Tipo alterado para: {btype_labels.get(new_type, new_type)}\n\n"
+                                "As mudanças serão aplicadas ao cadastrar produtos e vender.",
+                                parent=dialog)
+
+        ctk.CTkButton(btype_frame, text="Salvar Tipo de Negócio", command=_save_btype,
+                      fg_color="#0A4174", hover_color="#062F56", text_color="white",
+                      font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(15, 0))
+
+        ctk.CTkLabel(calc_frame, text="Calculadora de Margem de Lucro", font=ctk.CTkFont(family="Aileron", size=16, weight="bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 15))
+
+        ctk.CTkLabel(calc_frame, text="Preço de Custo (R$):", font=("Aileron", 12, "bold")).pack(anchor="w", pady=(5, 2))
+        e_custo_calc = ctk.CTkEntry(calc_frame, height=35, placeholder_text="Ex: 50.00")
+        e_custo_calc.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(calc_frame, text="Preço de Venda (R$):", font=("Aileron", 12, "bold")).pack(anchor="w", pady=(5, 2))
+        e_venda_calc = ctk.CTkEntry(calc_frame, height=35, placeholder_text="Ex: 80.00")
+        e_venda_calc.pack(fill="x", pady=(0, 10))
+
+        lbl_resultado_calc = ctk.CTkLabel(calc_frame, text="", font=("Aileron", 18, "bold"), text_color="#28a745")
+        lbl_resultado_calc.pack(pady=10)
+
+        lbl_detalhes_calc = ctk.CTkLabel(calc_frame, text="", font=("Aileron", 12), text_color=("#333", "white"), wraplength=400)
+        lbl_detalhes_calc.pack(pady=5)
+
+        def calcular_margem():
+            try:
+                custo = float(e_custo_calc.get().replace(",", "."))
+                venda = float(e_venda_calc.get().replace(",", "."))
+                if custo <= 0:
+                    lbl_resultado_calc.configure(text="Custo deve ser > 0", text_color="#FF6B6B")
+                    return
+                lucro = venda - custo
+                margem_pct = (lucro / custo) * 100
+                markup = (lucro / venda) * 100 if venda > 0 else 0
+
+                cor = "#28a745" if lucro > 0 else "#FF6B6B"
+                lbl_resultado_calc.configure(
+                    text=f"Lucro: R$ {lucro:.2f}  |  Margem: {margem_pct:.1f}%",
+                    text_color=cor
+                )
+                lbl_detalhes_calc.configure(
+                    text=f"Markup sobre venda: {markup:.1f}%\n"
+                         f"Para cada R$ 1,00 investido, retorna R$ {venda/custo:.2f}" if custo > 0 else ""
+                )
+            except ValueError:
+                lbl_resultado_calc.configure(text="Valores inválidos!", text_color="#FF6B6B")
+                lbl_detalhes_calc.configure(text="")
+
+        ctk.CTkButton(calc_frame, text="CALCULAR MARGEM DE LUCRO", command=calcular_margem,
+                      fg_color="#0A4174", hover_color="#062F56", text_color="white",
+                      font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(10, 0))
+
+        # ====== ABA ADMINISTRAÇÃO (alterar credenciais) ======
+        tab_admin = tabview.add("Administração")
+        admin_frame = ctk.CTkFrame(tab_admin, fg_color="transparent")
+        admin_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        ctk.CTkLabel(admin_frame, text="🔐 Alterar Credenciais de Acesso",
+                     font=ctk.CTkFont(family="Aileron", size=16, weight="bold"),
+                     text_color=("#001D39", "white")).pack(pady=(0, 5))
+        ctk.CTkLabel(admin_frame, text="Altere o usuário e senha usados para acessar Relatório e Configurações.",
+                     font=("Aileron", 11), text_color=("gray40", "gray70")).pack(pady=(0, 15))
+
+        admin_user_atual, _ = get_admin_credentials()
+
+        ctk.CTkLabel(admin_frame, text="Novo Usuário:", font=("Aileron", 12, "bold")).pack(anchor="w", pady=(5, 2))
+        e_admin_user = ctk.CTkEntry(admin_frame, height=35)
+        e_admin_user.insert(0, admin_user_atual)
+        e_admin_user.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(admin_frame, text="Nova Senha:", font=("Aileron", 12, "bold")).pack(anchor="w", pady=(5, 2))
+        e_admin_pass = ctk.CTkEntry(admin_frame, height=35, placeholder_text="Digite a nova senha", show="*")
+        e_admin_pass.pack(fill="x", pady=(0, 5))
+
+        ctk.CTkLabel(admin_frame, text="Confirmar Senha:", font=("Aileron", 12, "bold")).pack(anchor="w", pady=(5, 2))
+        e_admin_pass2 = ctk.CTkEntry(admin_frame, height=35, placeholder_text="Repita a nova senha", show="*")
+        e_admin_pass2.pack(fill="x", pady=(0, 10))
+
+        lbl_admin_status = ctk.CTkLabel(admin_frame, text="", font=("Aileron", 11))
+        lbl_admin_status.pack(pady=5)
+
+        def _salvar_credenciais():
+            novo_user = e_admin_user.get().strip()
+            nova_senha = e_admin_pass.get()
+            confirm_senha = e_admin_pass2.get()
+            if not novo_user:
+                lbl_admin_status.configure(text="Usuário não pode ser vazio.", text_color="#FF6B6B")
+                return
+            if len(nova_senha) < 4:
+                lbl_admin_status.configure(text="Senha deve ter pelo menos 4 caracteres.", text_color="#FF6B6B")
+                return
+            if nova_senha != confirm_senha:
+                lbl_admin_status.configure(text="As senhas não coincidem!", text_color="#FF6B6B")
+                return
+            set_admin_credentials(novo_user, nova_senha)
+            lbl_admin_status.configure(text="✅ Credenciais atualizadas com sucesso!", text_color="#28a745")
+
+        ctk.CTkButton(admin_frame, text="Salvar Credenciais", command=_salvar_credenciais,
+                      fg_color="#0A4174", hover_color="#062F56", text_color="white",
+                      font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(10, 0))
+
+        # ====== ABA LOJAS / FILIAIS ======
+        tab_lojas = tabview.add("Lojas")
+        lojas_frame = ctk.CTkFrame(tab_lojas, fg_color="transparent")
+        lojas_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        ctk.CTkLabel(lojas_frame, text="Gestão de Lojas / Filiais",
+                     font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 10))
+        ctk.CTkButton(lojas_frame, text="Abrir Gerenciador de Lojas", height=40,
+                      fg_color="#7BBDE8", hover_color="#49769F", text_color="#001D39",
+                      font=("Aileron", 12, "bold"),
+                      command=self.open_lojas_dialog).pack(fill="x", pady=5)
+
+        # ====== ABA USUÁRIOS ======
+        tab_users = tabview.add("Usuários")
+        users_frame = ctk.CTkFrame(tab_users, fg_color="transparent")
+        users_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        ctk.CTkLabel(users_frame, text="Gestão de Usuários (Multi-Usuário)",
+                     font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 10))
+        ctk.CTkLabel(users_frame, text="Perfis: Admin, Gerente, Vendedor, Caixa\nCada perfil tem permissões específicas.",
+                     font=("Aileron", 11), text_color=("gray40", "gray70"), justify="left").pack(pady=(0, 10), anchor="w")
+        ctk.CTkButton(users_frame, text="Abrir Gerenciador de Usuários", height=40,
+                      fg_color="#5DADE2", hover_color="#3498DB", text_color="#001D39",
+                      font=("Aileron", 12, "bold"),
+                      command=self.open_usuarios_dialog).pack(fill="x", pady=5)
+
+        # ====== ABA API MOBILE ======
+        tab_api = tabview.add("API Mobile")
+        api_frame = ctk.CTkFrame(tab_api, fg_color="transparent")
+        api_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        ctk.CTkLabel(api_frame, text="API REST para App Mobile",
+                     font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 10))
+
+        import api_server
+        api_status = "Disponível" if api_server.api_disponivel() else "Indisponível (instale: pip install flask)"
+        api_running = self.api_server is not None and hasattr(self.api_server, '_running') and self.api_server._running
+        ctk.CTkLabel(api_frame, text=f"Status: {api_status}", font=("Aileron", 11),
+                     text_color="#28a745" if "Disponível" == api_status else "#dc3545").pack(anchor="w", pady=5)
+        ctk.CTkLabel(api_frame, text=f"Servidor: {'Rodando na porta 5050' if api_running else 'Parado'}",
+                     font=("Aileron", 11)).pack(anchor="w", pady=5)
+        ctk.CTkLabel(api_frame, text="O app Android se conecta via rede local.\nCertifique-se de que PC e celular estão na mesma rede WiFi.",
+                     font=("Aileron", 10), text_color=("gray40", "gray70"), justify="left").pack(anchor="w", pady=10)
+
+        def _restart_api():
+            self._iniciar_api_server()
+            messagebox.showinfo("API", "API REST reiniciada na porta 5050.", parent=dialog)
+
+        ctk.CTkButton(api_frame, text="Reiniciar API", height=38,
+                      fg_color="#2874A6", hover_color="#1B4F72", text_color="white",
+                      font=("Aileron", 12, "bold"), command=_restart_api).pack(fill="x", pady=5)
+
+        # --- Separador ---
+        ctk.CTkLabel(api_frame, text="─" * 60, text_color=("gray70", "gray40")).pack(pady=(10, 5))
+
+        # --- Detectar IP local ---
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip_local = s.getsockname()[0]
+            s.close()
+        except Exception:
+            ip_local = "127.0.0.1"
+
+        ctk.CTkLabel(api_frame, text=f"IP deste PC: {ip_local}  |  Porta: 5050",
+                     font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(anchor="w", pady=5)
+
+        # --- Seleção de usuário para QR Code ---
+        ctk.CTkLabel(api_frame, text="Gerar QR Code de acesso para o App:",
+                     font=("Aileron", 11), text_color=("gray40", "gray70")).pack(anchor="w", pady=(10, 5))
+
+        qr_select_frame = ctk.CTkFrame(api_frame, fg_color="transparent")
+        qr_select_frame.pack(fill="x", pady=5)
+
+        usuarios_df = self.db.listar_usuarios()
+        usuarios_ativos = usuarios_df[usuarios_df['ativo'] == 1] if not usuarios_df.empty else usuarios_df
+        user_options = [f"{row['login']} ({row['perfil']})" for _, row in usuarios_ativos.iterrows()] if not usuarios_ativos.empty else ["Nenhum usuário"]
+        user_logins = [row['login'] for _, row in usuarios_ativos.iterrows()] if not usuarios_ativos.empty else []
+
+        ctk.CTkLabel(qr_select_frame, text="Usuário:", font=("Aileron", 11)).pack(side="left", padx=(0, 8))
+        combo_user = ctk.CTkComboBox(qr_select_frame, values=user_options, width=200, state="readonly")
+        combo_user.pack(side="left", padx=(0, 8))
+        if user_options:
+            combo_user.set(user_options[0])
+
+        # Campo de senha para incluir no QR
+        senha_frame = ctk.CTkFrame(api_frame, fg_color="transparent")
+        senha_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(senha_frame, text="Senha:", font=("Aileron", 11)).pack(side="left", padx=(0, 8))
+        entry_senha_qr = ctk.CTkEntry(senha_frame, show="*", width=200, placeholder_text="Senha do usuário")
+        entry_senha_qr.pack(side="left", padx=(0, 8))
+
+        # Label para mostrar o QR Code
+        qr_label = ctk.CTkLabel(api_frame, text="")
+        qr_label.pack(pady=10)
+
+        def _gerar_qr_code():
+            idx = combo_user.current() if hasattr(combo_user, 'current') else user_options.index(combo_user.get()) if combo_user.get() in user_options else -1
+            if idx < 0 or not user_logins:
+                messagebox.showwarning("QR Code", "Selecione um usuário válido.", parent=dialog)
+                return
+            senha_val = entry_senha_qr.get().strip()
+            if not senha_val:
+                messagebox.showwarning("QR Code", "Digite a senha do usuário para gerar o QR Code.", parent=dialog)
+                return
+            login_val = user_logins[idx]
+
+            # Validar credenciais antes de gerar QR
+            user = self.db.autenticar_usuario(login_val, senha_val)
+            if not user:
+                messagebox.showerror("QR Code", "Senha incorreta para o usuário selecionado.", parent=dialog)
+                return
+
+            # Gerar token de sessão seguro (sem incluir a senha no QR)
+            import secrets
+            token = secrets.token_hex(32)
+            if self.api_server and hasattr(self.api_server, '_sessions'):
+                import time
+                self.api_server._sessions[token] = {
+                    "user": user,
+                    "expires": time.time() + self.api_server._SESSION_TTL
+                }
+
+            # QR Code contém apenas IP, porta, login e token (SEM senha)
+            qr_data = json.dumps({"ip": ip_local, "port": 5050, "login": login_val, "token": token}, ensure_ascii=False)
+            try:
+                import qrcode
+                from PIL import Image as PILImage, ImageTk
+                qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=2)
+                qr.add_data(qr_data)
+                qr.make(fit=True)
+                img_qr = qr.make_image(fill_color="#001D39", back_color="white").convert("RGB")
+                img_tk = ImageTk.PhotoImage(img_qr)
+                qr_label.configure(image=img_tk, text="")
+                qr_label._img_ref = img_tk  # manter referência
+                ctk.CTkLabel(api_frame, text="📱 Escaneie este QR Code com o App ao Cubo.\n🔒 Token seguro (expira em 8h — sem senha exposta).",
+                             font=("Aileron", 11, "bold"), text_color="#28a745").pack(pady=(0, 5))
+            except Exception as e:
+                messagebox.showerror("Erro", f"Erro ao gerar QR Code: {e}", parent=dialog)
+
+        ctk.CTkButton(api_frame, text="📱 Gerar QR Code para App", height=42,
+                      fg_color="#28a745", hover_color="#1e7e34", text_color="white",
+                      font=("Aileron", 13, "bold"), command=_gerar_qr_code).pack(fill="x", pady=(5, 10))
+
+    def open_estabelecimento_manager(self):
+        """Gerencia tarefas de organização do espaço físico (estabelecimento)"""
+        window = ctk.CTkToplevel(self)
+        window.title("Gestão de Estabelecimento")
+        window.geometry("750x650")
+        window.attributes("-topmost", True)
+
+        # Frame principal
+        main_frame = ctk.CTkFrame(window, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        # Título
+        title_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        title_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(title_frame, text="Organização do Estabelecimento", font=ctk.CTkFont(family="Aileron", size=18, weight="bold"), text_color=("#001D39", "white")).pack()
+        
+        # Card de Adição
+        add_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        add_frame.pack(fill="x", pady=(0, 20))
+        
+        ctk.CTkLabel(add_frame, text="Adicionar Tarefa", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 10), padx=15, anchor="w")
+        
+        # Campo Área/Local
+        ctk.CTkLabel(add_frame, text="Área/Local:", font=ctk.CTkFont(family="Aileron", weight="bold", size=11), text_color=("#001D39", "white")).pack(pady=(5, 2), padx=15, anchor="w")
+        entry_area = ctk.CTkEntry(add_frame, placeholder_text="Ex: Cozinha, Estoque...", height=35)
+        entry_area.pack(pady=2, padx=15, fill="x")
+        
+        # Campo Tarefa
+        ctk.CTkLabel(add_frame, text="Tarefa:", font=ctk.CTkFont(family="Aileron", weight="bold", size=11), text_color=("#001D39", "white")).pack(pady=(10, 2), padx=15, anchor="w")
+        entry_tarefa = ctk.CTkEntry(add_frame, placeholder_text="Ex: Limpar prateleiras...", height=35)
+        entry_tarefa.pack(pady=2, padx=15, fill="x")
+        
+        # Campo Prioridade
+        ctk.CTkLabel(add_frame, text="Prioridade:", font=ctk.CTkFont(family="Aileron", weight="bold", size=11), text_color=("#001D39", "white")).pack(pady=(10, 2), padx=15, anchor="w")
+        var_prioridade = ctk.StringVar(value="Média")
+        combo_prioridade = ctk.CTkComboBox(add_frame, variable=var_prioridade, 
+                                        values=["Baixa", "Média", "Alta"], state="readonly", height=35)
+        combo_prioridade.pack(pady=2, padx=15, fill="x")
+        
+        def add_task():
+            area = entry_area.get().strip()
+            tarefa = entry_tarefa.get().strip()
+            prioridade = var_prioridade.get()
+            
+            if area and tarefa:
+                self.db.adicionar_tarefa_estabelecimento(area, tarefa, prioridade)
+                messagebox.showinfo("Sucesso", "Tarefa adicionada!", parent=window)
+                refresh_list()
+                self.refresh_dashboard()  # Atualizar dashboard principal
+                entry_area.delete(0, "end")
+                entry_tarefa.delete(0, "end")
+            else:
+                messagebox.showerror("Erro", "Preencha Área/Local e Tarefa.", parent=window)
+
+        btn_frame = ctk.CTkFrame(add_frame, fg_color="transparent")
+        btn_frame.pack(pady=15, padx=15, fill="x")
+        ctk.CTkButton(btn_frame, text="Adicionar Tarefa", command=add_task, height=35,
+                    fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F",
+                    font=ctk.CTkFont(family="Aileron", weight="bold")).pack(fill="x")
+
+        # Card de Lista
+        list_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        list_card.pack(fill="both", expand=True)
+        
+        ctk.CTkLabel(list_card, text="Tarefas Pendentes", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 10), padx=15, anchor="w")
+        
+        list_frame = ctk.CTkScrollableFrame(list_card, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        list_frame.pack(pady=10, padx=15, fill="both", expand=True)
+
+        def refresh_list():
+            for widget in list_frame.winfo_children():
+                widget.destroy()
+            
+            df = self.db.listar_tarefas_estabelecimento()
+            if df.empty:
+                ctk.CTkLabel(list_frame, text="Nenhuma tarefa encontrada.", text_color=("#999999", "#AAAAAA")).pack(pady=20)
+                return
+
+            for index, row in df.iterrows():
+                task_frame = ctk.CTkFrame(list_frame, fg_color=("white", "#404040"), corner_radius=8, border_width=1, border_color=("#EEEEEE", "#555555"))
+                task_frame.pack(pady=5, padx=5, fill="x")
+                
+                # Cor da prioridade
+                prioridade = row['prioridade']
+                cor_prioridade = {"Alta": "#FF6B6B", "Média": "#6EA2B3", "Baixa": "#7BBDE8"}.get(prioridade, "#FFD93D")
+                
+                # Info frame
+                info_frame = ctk.CTkFrame(task_frame, fg_color="transparent")
+                info_frame.pack(side="left", padx=10, pady=8, fill="x", expand=True)
+                
+                # Prioridade com cor
+                priority_label = ctk.CTkLabel(info_frame, text=f"{prioridade}", text_color=cor_prioridade, font=ctk.CTkFont(family="Aileron", weight="bold", size=10))
+                priority_label.pack(anchor="w")
+                
+                # Display task info
+                info_text = f"{row['area_local']} - {row['tarefa']}"
+                ctk.CTkLabel(info_frame, text=info_text, anchor="w", text_color=("#333333", "white"), font=ctk.CTkFont(family="Aileron", size=11)).pack(anchor="w")
+                
+                status_text = f"Status: {row['status']}"
+                ctk.CTkLabel(info_frame, text=status_text, anchor="w", text_color=("#999999", "#AAAAAA"), font=ctk.CTkFont(family="Aileron", size=9)).pack(anchor="w")
+                
+                # Botões
+                btn_frame = ctk.CTkFrame(task_frame, fg_color="transparent")
+                btn_frame.pack(side="right", padx=10, pady=8)
+                
+                # Botão de status
+                status_atual = row['status']
+                proximo_status = "Em Progresso" if status_atual == "Pendente" else "Concluído" if status_atual == "Em Progresso" else "Pendente"
+                cor_status = "#0A4174" if status_atual == "Pendente" else "#6EA2B3" if status_atual == "Em Progresso" else "#7BBDE8"
+                
+                def update_status(id_val=row['id'], novo_status=proximo_status):
+                    self.db.atualizar_status_estabelecimento(id_val, novo_status)
+                    self.refresh_metas_list()
+        
+                ctk.CTkButton(btn_frame, text=f"{proximo_status}", width=110, fg_color=cor_status, 
+                            text_color="black" if status_atual != "Pendente" else "white",
+                            hover_color=cor_status, command=update_status, font=ctk.CTkFont(family="Aileron", weight="bold", size=10)).pack(side="left", padx=3)
+                
+                def delete_task(id_val=row['id']):
+                    if messagebox.askyesno("Confirmar", "Remover esta tarefa?", parent=window):
+                        self.db.remover_tarefa_estabelecimento(id_val)
+                        refresh_list()
+                        self.refresh_dashboard()  # Atualizar dashboard principal
+
+                ctk.CTkButton(btn_frame, text="Remover", width=30, fg_color="#FF6B6B", 
+                            hover_color="#FF5252", text_color="white", command=delete_task).pack(side="left", padx=2)
+
+        refresh_list()
+
+    def open_saldo_dialog(self):
+        saldo_atual = self.db.get_saldo_atual()
+        
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Gestão de Saldo")
+        dialog.geometry("450x450")
+        dialog.attributes("-topmost", True)
+        
+        # Frame principal com padding
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        # Título com saldo atual
+        title_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        title_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(title_frame, text="Gestão de Saldo", font=ctk.CTkFont(family="Aileron", size=18, weight="bold"), text_color=("#001D39", "white")).pack()
+        ctk.CTkLabel(title_frame, text=f"Saldo Atual: R$ {saldo_atual:.2f}".replace('.', ','), 
+                    font=ctk.CTkFont(family="Aileron", size=14, weight="bold"), text_color="#7BBDE8").pack(pady=(10, 0))
+        
+        # Card com campos
+        card_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        card_frame.pack(fill="both", expand=True)
+        
+        # Campos com layout melhorado
+        ctk.CTkLabel(card_frame, text="Valor da Entrada (R$):", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+        entry_valor = ctk.CTkEntry(card_frame, placeholder_text="Ex: 1000,00", height=35)
+        entry_valor.pack(pady=5, padx=15, fill="x")
+        
+        ctk.CTkLabel(card_frame, text="Descrição:", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+        entry_desc = ctk.CTkEntry(card_frame, placeholder_text="Ex: Venda de produtos", height=35)
+        entry_desc.pack(pady=5, padx=15, fill="x")
+        
+        # Frame para botões
+        button_frame = ctk.CTkFrame(card_frame, fg_color="transparent")
+        button_frame.pack(pady=20, padx=15, fill="x")
+        
+        def adicionar():
+            valor = entry_valor.get().strip()
+            desc = entry_desc.get().strip()
+            if valor:
+                try:
+                    valor_str = valor.replace(',', '.')
+                    valor_float = float(valor_str)
+                    self.db.adicionar_entrada(valor_float, desc or "Entrada Manual")
+                    messagebox.showinfo("Sucesso", "Saldo adicionado!", parent=dialog)
+                    dialog.destroy()
+                except ValueError:
+                    messagebox.showerror("Erro", "Valor inválido. Use vírgula ou ponto como separador decimal.", parent=dialog)
+            else:
+                messagebox.showerror("Erro", "Digite um valor.", parent=dialog)
+        
+        def limpar():
+            entry_valor.delete(0, "end")
+            entry_desc.delete(0, "end")
+        
+        ctk.CTkButton(button_frame, text="Adicionar", command=adicionar, height=40, 
+                    fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F",
+                    font=ctk.CTkFont(family="Aileron", weight="bold")).pack(side="left", padx=5, fill="x", expand=True)
+        ctk.CTkButton(button_frame, text="Limpar", command=limpar, height=40, 
+                    fg_color="#CCCCCC", text_color="black", hover_color="#AAAAAA",
+                    font=ctk.CTkFont(family="Aileron", weight="bold")).pack(side="left", padx=5, fill="x", expand=True)
+
+    def open_chat_ai(self):
+        chat_window = ctk.CTkToplevel(self)
+        chat_window.title("Chat com IA")
+        chat_window.geometry("600x750")
+        chat_window.attributes("-topmost", True)
+
+        # Frame principal
+        main_frame = ctk.CTkFrame(chat_window, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        # Título
+        title_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        title_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(title_frame, text="Assistente IA Gemini", font=ctk.CTkFont(family="Aileron", size=18, weight="bold"), text_color=("#001D39", "white")).pack()
+        
+        # Card com histórico
+        card_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        card_frame.pack(fill="both", expand=True, pady=(0, 15))
+        
+        # Histórico de chat
+        chat_history = ctk.CTkTextbox(card_frame, width=560, height=500, fg_color=("#F5F5F5", "#333333"), corner_radius=10, border_width=0)
+        chat_history.pack(pady=10, padx=10, fill="both", expand=True)
+        chat_history.insert("0.0", "IA: Olá! 👋 Sou seu assistente inteligente. Pergunte qualquer coisa!\n\n"
+                                "📊 CONSULTAS:\n"
+                                "  • 'Resumo do dia' / 'Resumo do mês'\n"
+                                "  • 'Quanto vendi hoje?' / 'Vendas da semana'\n"
+                                "  • 'Qual meu lucro do mês?'\n"
+                                "  • 'Quanto de fiado pendente?'\n"
+                                "  • 'Contas a pagar vencendo'\n"
+                                "  • 'Ranking de mais vendidos'\n"
+                                "  • 'Produtos com estoque baixo'\n"
+                                "  • 'Produtos vencendo'\n\n"
+                                "🔧 COMANDOS:\n"
+                                "  • 'Registre um gasto de 50 em Material'\n"
+                                "  • 'Adicione produto Tinta com 10 un a 25 reais'\n"
+                                "  • 'Venda 3 unidades de Tinta'\n"
+                                "  📷 Use o botão 📷 para anexar uma imagem ao adicionar produto!\n\n"
+                                "📈 ANÁLISES:\n"
+                                "  • 'Me dê sugestões' / 'DRE' / 'Fluxo de caixa'\n"
+                                "  • 'Previsão de gastos' / 'Comparativo mensal'\n\n"
+                                "💡 Digite 'ajuda' para ver todos os comandos!\n\n")
+
+        # Frame para input
+        input_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        input_frame.pack(fill="x", pady=(0, 0))
+
+        # Variável para imagem anexada
+        _chat_img_path = [None]  # lista para mutabilidade em closure
+        lbl_img_status = ctk.CTkLabel(input_frame, text="", font=ctk.CTkFont(family="Aileron", size=9),
+                                       text_color=("#28a745", "#28a745"), width=20)
+
+        def _anexar_imagem_chat():
+            from tkinter import filedialog as fd
+            path = fd.askopenfilename(
+                title="Anexar imagem ao comando",
+                filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+                           ("Todos", "*.*")]
+            )
+            if path:
+                _chat_img_path[0] = path
+                nome_arq = os.path.basename(path)
+                lbl_img_status.configure(text=f"📷 {nome_arq[:20]}")
+                chat_history.insert("end", f"📷 Imagem anexada: {nome_arq}\n")
+                chat_history.see("end")
+
+        btn_img = ctk.CTkButton(input_frame, text="📷", width=35, height=35, fg_color="#6EA2B3",
+                                hover_color="#49769F", text_color="white",
+                                font=ctk.CTkFont(family="Aileron", size=14),
+                                command=_anexar_imagem_chat)
+        btn_img.pack(side="left", padx=(0, 5))
+
+        entry = ctk.CTkEntry(input_frame, placeholder_text="Digitar pergunta ou comando...", height=35)
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        lbl_img_status.pack(side="left", padx=(0, 5))
+
+        def send_message():
+            question = entry.get().strip()
+            if not question: 
+                return
+            
+            chat_history.insert("end", f"Você: {question}\n")
+            entry.delete(0, "end")
+            
+            imagem = _chat_img_path[0]
+            _chat_img_path[0] = None
+            lbl_img_status.configure(text="")
+            
+            answer = self.ai.process_query(question, imagem_path=imagem)
+            chat_history.insert("end", f"IA: {answer}\n\n")
+            chat_history.see("end")
+            
+            # Se foi um comando executado com sucesso, atualizar o dashboard
+            if "✅" in answer:
+                self.refresh_dashboard()
+
+        btn_send = ctk.CTkButton(input_frame, text="Enviar", width=80, fg_color="#7BBDE8", 
+                                text_color="black", hover_color="#49769F", command=send_message,
+                                font=ctk.CTkFont(family="Aileron", weight="bold"), height=35)
+        btn_send.pack(side="right")
+        
+        # Permitir enviar com Enter
+        entry.bind("<Return>", lambda e: send_message())
+
+
+
+    def open_lista_dialog(self):
+        """Lista unificada com abas, busca em tempo real e filtros por categoria/status."""
+        window = ctk.CTkToplevel(self)
+        window.title("Lista de Itens")
+        window.geometry("780x650")
+        window.attributes("-topmost", True)
+        window.lift()
+        window.focus_force()
+
+        main_frame = ctk.CTkFrame(window, fg_color="transparent")
+        main_frame.pack(padx=15, pady=15, fill="both", expand=True)
+
+        # === Header ===
+        header = ctk.CTkFrame(main_frame, fg_color="transparent")
+        header.pack(fill="x")
+        ctk.CTkLabel(header, text="📋 Lista",
+                     font=ctk.CTkFont(family="Aileron", size=20, weight="bold"),
+                     text_color=("#001D39", "white")).pack(side="left")
+        lbl_count = ctk.CTkLabel(header, text="",
+                                 font=ctk.CTkFont(family="Aileron", size=12),
+                                 text_color=("#999999", "#AAAAAA"))
+        lbl_count.pack(side="right", padx=10)
+
+        # === Abas ===
+        tab_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        tab_frame.pack(fill="x", pady=(10, 0))
+
+        current_tab = {"value": "produto"}
+        tab_buttons = {}
+        for tab_id, tab_label in [("produto", "📦 Produtos"), ("gasto", "💰 Gastos"), ("tarefa", "📝 Tarefas")]:
+            btn = ctk.CTkButton(tab_frame, text=tab_label, width=130, height=35, corner_radius=20,
+                                font=ctk.CTkFont(family="Aileron", size=12, weight="bold"),
+                                fg_color=("#EBEBF0", "#3A3A3A"), text_color=("#333333", "white"),
+                                hover_color=("#D9D9E0", "#4A4A4A"),
+                                command=lambda t=tab_id: switch_tab(t))
+            btn.pack(side="left", padx=5)
+            tab_buttons[tab_id] = btn
+
+        # === Busca + Filtro ===
+        filter_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        filter_frame.pack(fill="x", pady=10)
+
+        search_var = ctk.StringVar()
+        search_entry = ctk.CTkEntry(filter_frame,
+                                    placeholder_text="🔍 Buscar por nome, descrição...",
+                                    textvariable=search_var, height=38, corner_radius=20)
+        search_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        cat_var = ctk.StringVar(value="Todas")
+        cat_combo = ctk.CTkComboBox(filter_frame, variable=cat_var, values=["Todas"],
+                                    width=170, height=38, state="readonly",
+                                    font=ctk.CTkFont(family="Aileron", size=11),
+                                    command=lambda _: refresh_list())
+        cat_combo.pack(side="right")
+
+        # === Lista scrollável ===
+        list_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        list_card.pack(fill="both", expand=True, pady=(5, 0))
+
+        scroll = ctk.CTkScrollableFrame(list_card, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=8)
+
+        _search_timer = {"id": None}
+
+        # ---- Funções internas ----
+
+        def refresh_list(*_args):
+            for w in scroll.winfo_children():
+                w.destroy()
+
+            tab = current_tab["value"]
+            search = search_var.get().strip().lower()
+            cat_filter = cat_var.get()
+
+            if tab == "produto":
+                df = self.db.listar_produtos()
+                display_col = "nome"
+            elif tab == "gasto":
+                df = self.db.listar_gastos()
+                display_col = "descricao"
+            else:
+                df = self.db.listar_tarefas_estabelecimento()
+                display_col = "tarefa"
+
+            if df is None or df.empty:
+                ctk.CTkLabel(scroll, text="Nenhum item cadastrado.",
+                             text_color=("#999999", "#AAAAAA"),
+                             font=ctk.CTkFont(family="Aileron", size=13)).pack(pady=40)
+                lbl_count.configure(text="0 itens")
+                return
+
+            # Filtro de busca
+            if search:
+                mask = df[display_col].astype(str).str.lower().str.contains(search, na=False, regex=False)
+                if "categoria" in df.columns:
+                    mask = mask | df["categoria"].astype(str).str.lower().str.contains(search, na=False, regex=False)
+                if "area_local" in df.columns:
+                    mask = mask | df["area_local"].astype(str).str.lower().str.contains(search, na=False, regex=False)
+                df = df[mask]
+
+            # Filtro de categoria / status
+            if tab in ("produto", "gasto") and cat_filter != "Todas" and "categoria" in df.columns:
+                df = df[df["categoria"] == cat_filter]
+            elif tab == "tarefa" and cat_filter != "Todos" and "status" in df.columns:
+                df = df[df["status"] == cat_filter]
+
+            total = len(df)
+            lbl_count.configure(text=f"{total} {'item' if total == 1 else 'itens'}")
+
+            if df.empty:
+                ctk.CTkLabel(scroll, text="Nenhum resultado para a busca.",
+                             text_color=("#999999", "#AAAAAA"),
+                             font=ctk.CTkFont(family="Aileron", size=13)).pack(pady=40)
+                return
+
+            for _, row in df.iterrows():
+                _create_list_item(tab, row, display_col)
+
+        def _create_list_item(tab, row, display_col):
+            item_frame = ctk.CTkFrame(scroll, fg_color=("#F8F9FA", "#3A3A3A"), corner_radius=10,
+                                      border_width=1, border_color=("#EEEEEE", "#555555"))
+            item_frame.pack(fill="x", pady=3)
+
+            # Botões (pack primeiro para ficarem à direita)
+            btn_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
+            btn_frame.pack(side="right", padx=10, pady=10)
+
+            def do_edit(t=tab, r=row):
+                placeholder = ctk.CTkToplevel(self)
+                placeholder.withdraw()
+                self.perform_edit(t, r, placeholder)
+
+            def do_remove(t=tab, r=row):
+                if messagebox.askyesno("Confirmar", f"Remover este {t}?", parent=window):
+                    if t == "produto":
+                        self.db.remover_produto(r["id"])
+                    elif t == "gasto":
+                        self.db.remover_gasto(r["id"])
+                    elif t == "tarefa":
+                        self.db.remover_tarefa_estabelecimento(r["id"])
+                    refresh_list()
+                    self.refresh_dashboard()
+                else:
+                    window.lift()
+
+            ctk.CTkButton(btn_frame, text="✏️ Editar", width=80, height=30, corner_radius=8,
+                          fg_color="#5DADE2", text_color="#001D39", hover_color="#3498DB",
+                          font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
+                          command=do_edit).pack(side="left", padx=2)
+            ctk.CTkButton(btn_frame, text="🗑️", width=35, height=30, corner_radius=8,
+                          fg_color="#E74C3C", text_color="white", hover_color="#C0392B",
+                          command=do_remove).pack(side="left", padx=2)
+
+            # Conteúdo à esquerda
+            content = ctk.CTkFrame(item_frame, fg_color="transparent")
+            content.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+
+            if tab == "produto":
+                # Thumbnail do produto
+                if row.get("imagem"):
+                    try:
+                        img_path = os.path.join(self.db.data_dir, "product_images", row["imagem"])
+                        if os.path.exists(img_path):
+                            pil_img = Image.open(img_path)
+                            pil_img.thumbnail((40, 40))
+                            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(40, 40))
+                            ctk.CTkLabel(content, image=ctk_img, text="").pack(side="left", padx=(0, 10))
+                    except Exception:
+                        pass
+
+                text_frame = ctk.CTkFrame(content, fg_color="transparent")
+                text_frame.pack(side="left", fill="both", expand=True)
+                ctk.CTkLabel(text_frame, text=row["nome"],
+                             font=ctk.CTkFont(family="Aileron", size=13, weight="bold"),
+                             text_color=("#001D39", "white")).pack(anchor="w")
+
+                preco = row.get("preco", 0) or 0
+                qtd = row.get("quantidade", 0) or 0
+                cat = row.get("categoria", "")
+                qtd_color = "#E74C3C" if qtd <= 0 else "#F39C12" if qtd < 5 else ("#777777", "#AAAAAA")
+
+                info_f = ctk.CTkFrame(text_frame, fg_color="transparent")
+                info_f.pack(anchor="w")
+                ctk.CTkLabel(info_f, text=cat, font=ctk.CTkFont(family="Aileron", size=10),
+                             text_color=("#777777", "#AAAAAA")).pack(side="left")
+                ctk.CTkLabel(info_f, text=" • ", font=ctk.CTkFont(family="Aileron", size=10),
+                             text_color=("#CCCCCC", "#666666")).pack(side="left")
+                ctk.CTkLabel(info_f, text=f"Qtd: {qtd}",
+                             font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
+                             text_color=qtd_color).pack(side="left")
+                ctk.CTkLabel(info_f, text=" • ", font=ctk.CTkFont(family="Aileron", size=10),
+                             text_color=("#CCCCCC", "#666666")).pack(side="left")
+                ctk.CTkLabel(info_f, text=f"R$ {preco:.2f}",
+                             font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
+                             text_color=("#28a745", "#6BCB77")).pack(side="left")
+
+            elif tab == "gasto":
+                ctk.CTkLabel(content, text=row.get("descricao", ""),
+                             font=ctk.CTkFont(family="Aileron", size=13, weight="bold"),
+                             text_color=("#001D39", "white")).pack(anchor="w")
+                valor = row.get("valor", 0) or 0
+                cat = row.get("categoria", "")
+                data = row.get("data", "")
+                ctk.CTkLabel(content, text=f"{cat}  •  R$ {valor:.2f}  •  {data}",
+                             font=ctk.CTkFont(family="Aileron", size=10),
+                             text_color=("#777777", "#AAAAAA")).pack(anchor="w")
+
+            else:  # tarefa
+                ctk.CTkLabel(content, text=row.get("tarefa", ""),
+                             font=ctk.CTkFont(family="Aileron", size=13, weight="bold"),
+                             text_color=("#001D39", "white")).pack(anchor="w")
+                area = row.get("area_local", "")
+                prio = row.get("prioridade", "")
+                status = row.get("status", "")
+                prio_color = "#E74C3C" if prio == "Alta" else "#F39C12" if prio == "Média" else ("#777777", "#AAAAAA")
+                status_color = "#28a745" if status == "Concluído" else "#F39C12" if status == "Em Progresso" else ("#777777", "#AAAAAA")
+
+                info_f = ctk.CTkFrame(content, fg_color="transparent")
+                info_f.pack(anchor="w")
+                ctk.CTkLabel(info_f, text=area, font=ctk.CTkFont(family="Aileron", size=10),
+                             text_color=("#777777", "#AAAAAA")).pack(side="left")
+                ctk.CTkLabel(info_f, text=" • ", font=ctk.CTkFont(family="Aileron", size=10),
+                             text_color=("#CCCCCC", "#666666")).pack(side="left")
+                ctk.CTkLabel(info_f, text=prio,
+                             font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
+                             text_color=prio_color).pack(side="left")
+                ctk.CTkLabel(info_f, text=" • ", font=ctk.CTkFont(family="Aileron", size=10),
+                             text_color=("#CCCCCC", "#666666")).pack(side="left")
+                ctk.CTkLabel(info_f, text=status,
+                             font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
+                             text_color=status_color).pack(side="left")
+
+        def switch_tab(tab_name):
+            current_tab["value"] = tab_name
+            for name, btn in tab_buttons.items():
+                if name == tab_name:
+                    btn.configure(fg_color="#0A4174", text_color="white")
+                else:
+                    btn.configure(fg_color=("#EBEBF0", "#3A3A3A"), text_color=("#333333", "white"))
+            _update_filter_options(tab_name)
+            search_var.set("")
+            refresh_list()
+
+        def _update_filter_options(tab_name):
+            if tab_name in ("produto", "gasto"):
+                cats = ["Todas"]
+                try:
+                    cat_list = self.db.listar_categorias(tab_name)
+                    if cat_list:
+                        cats.extend(cat_list)
+                except Exception:
+                    pass
+                cat_combo.configure(values=cats)
+                cat_var.set("Todas")
+            else:  # tarefa → filtrar por status
+                cat_combo.configure(values=["Todos", "Pendente", "Em Progresso", "Concluído"])
+                cat_var.set("Todos")
+
+        def _on_search(*_args):
+            if _search_timer["id"]:
+                window.after_cancel(_search_timer["id"])
+            _search_timer["id"] = window.after(300, refresh_list)
+
+        search_var.trace_add("write", _on_search)
+
+        # Atualizar lista quando a janela recebe foco (após edição de item)
+        def _on_focus(event):
+            if event.widget == window:
+                refresh_list()
+        window.bind("<FocusIn>", _on_focus)
+
+        # Inicializar na aba Produtos
+        switch_tab("produto")
+        search_entry.focus_set()
+
+    def open_edit_selection_dialog(self):
+        self.open_selection_dialog("Editar", self.perform_edit)
+
+    def open_remove_selection_dialog(self):
+        self.open_selection_dialog("Remover", self.perform_remove)
+
+    def open_selection_dialog(self, action_name, callback):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"{action_name} Item")
+        dialog.geometry("450x550")
+        dialog.attributes("-topmost", True)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.lift()
+        dialog.focus_force()
+
+        # Frame principal
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        # Título
+        title_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        title_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(title_frame, text=f"{action_name} Item", font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack()
+        ctk.CTkLabel(title_frame, text="Selecione o tipo de item", font=("Aileron", 11), text_color=("#999999", "#AAAAAA")).pack()
+        
+        # Card com botões
+        card_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        card_frame.pack(fill="both", expand=True)
+        
+        button_frame = ctk.CTkFrame(card_frame, fg_color="transparent")
+        button_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        def select_type(type_):
+            dialog.destroy()
+            self.list_items_for_action(type_, action_name, callback)
+
+        ctk.CTkButton(button_frame, text="Produto", command=lambda: select_type("produto"), height=50,
+                    fg_color="#0A4174", text_color="white", hover_color="#0A1F4D",
+                    font=("Aileron", 12, "bold")).pack(pady=10, fill="x")
+        ctk.CTkButton(button_frame, text="Gasto", command=lambda: select_type("gasto"), height=50,
+                    fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F",
+                    font=("Aileron", 12, "bold")).pack(pady=10, fill="x")
+        ctk.CTkButton(button_frame, text="Tarefa", command=lambda: select_type("tarefa"), height=50,
+                    fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F",
+                    font=("Aileron", 12, "bold")).pack(pady=10, fill="x")
+
+    def list_items_for_action(self, type_, action_name, callback):
+        list_window = ctk.CTkToplevel(self)
+        list_window.title(f"Selecione o {type_} para {action_name}")
+        list_window.geometry("550x500")
+        list_window.attributes("-topmost", True)
+        list_window.protocol("WM_DELETE_WINDOW", list_window.destroy)
+        list_window.lift()
+        list_window.focus_force()
+
+        if type_ == "produto":
+            df = self.db.listar_produtos()
+            display_col = "nome"
+            emoji = ""
+        elif type_ == "gasto":
+            df = self.db.listar_gastos()
+            display_col = "descricao"
+            emoji = ""
+        elif type_ == "tarefa":
+            df = self.db.listar_tarefas_estabelecimento()
+            display_col = "tarefa"
+            emoji = ""
+        else:
+            df = None
+            emoji = ""
+
+        if df is None or df.empty:
+            # Frame principal
+            main_frame = ctk.CTkFrame(list_window, fg_color="transparent")
+            main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+            
+            card_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+            card_frame.pack(fill="both", expand=True)
+            
+            ctk.CTkLabel(card_frame, text=f"Nenhum {type_} encontrado.", text_color=("#999999", "#AAAAAA")).pack(pady=40)
+            return
+
+        # Frame principal
+        main_frame = ctk.CTkFrame(list_window, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        # Título
+        title_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        title_frame.pack(fill="x", pady=(0, 15))
+        ctk.CTkLabel(title_frame, text=f"Selecione o {type_}", font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack()
+        
+        # Card com lista
+        card_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        card_frame.pack(fill="both", expand=True)
+        
+        scroll = ctk.CTkScrollableFrame(card_frame, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        scroll.pack(fill="both", expand=True, padx=10, pady=10)
+
+        logger.debug("Listando itens para: %s", type_)
+        if df is not None:
+            logger.debug("Total de itens: %d", len(df))
+            logger.debug("Colunas: %s", df.columns.tolist())
+
+        for index, row in df.iterrows():
+            try:
+                icon_image = None
+                
+                if type_ == "meta":
+                    # Para metas, mostrar título, descrição e status
+                    text = f"{row[display_col]}"
+                    if row.get('descricao'):
+                        text += f" - {row['descricao'][:30]}"
+                    color = "#CCCCCC" if row['status'] == "Concluído" else ("#333333", "white")
+                elif type_ == "tarefa":
+                    text = f"{row['area_local']} - {row['tarefa']} ({row['prioridade']})"
+                    color = "#CCCCCC" if row['status'] == "Concluído" else ("#333333", "white")
+                else:
+                    # Lógica simplificada para preço/valor
+                    val = row.get('valor', row.get('preco', 0))
+                    text = f"{row[display_col]} (R$ {val})"
+                    color = ("#333333", "white")
+                    
+                    # Carregar imagem para produtos
+                    if type_ == "produto" and 'imagem' in row and row['imagem']:
+                        try:
+                            img_path = os.path.join(self.db.data_dir, "product_images", row['imagem'])
+                            if os.path.exists(img_path):
+                                pil_img = Image.open(img_path)
+                                 # Usar miniatura
+                                icon_image = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(30, 30))
+                        except Exception as e:
+                            logger.debug("Erro imagem miniatura: %s", e)
+                
+                logger.debug("Criando botão para: %s", text)
+                
+                item_frame = ctk.CTkFrame(scroll, fg_color=("white", "#404040"), corner_radius=8, border_width=1, border_color=("#EEEEEE", "#555555"))
+                item_frame.pack(pady=3, fill="x")
+                
+                btn = ctk.CTkButton(item_frame, text=text, text_color=color, fg_color=("white", "#404040"), 
+                                    hover_color=("#F0F0F0", "#505050"), anchor="w",
+                                    font=("Arial", 12),
+                                    image=icon_image, compound="left",
+                                    command=lambda r=row: callback(type_, r, list_window))
+                btn.pack(pady=10, padx=10, fill="x")
+            except Exception as e:
+                logger.warning("Erro ao criar item %s: %s", index, e)
+
+    def perform_remove(self, type_, row, window):
+        if messagebox.askyesno("Confirmar", f"Tem certeza que deseja remover este {type_}?", parent=window):
+            if type_ == "produto":
+                self.db.remover_produto(row['id'])
+            elif type_ == "gasto":
+                self.db.remover_gasto(row['id'])
+            elif type_ == "tarefa":
+                self.db.remover_tarefa_estabelecimento(row['id'])
+            window.destroy()
+            messagebox.showinfo("Sucesso", "Item removido!", parent=self)
+            self.refresh_dashboard()  # Atualizar em tempo real
+        else:
+            window.attributes("-topmost", True)
+
+    def perform_edit(self, type_, row, window):
+        window.destroy()
+        
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Editar {type_.capitalize()}")
+        dialog.geometry("450x600")
+        dialog.attributes("-topmost", True)
+        
+        # Frame principal
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        # Título
+        title_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        title_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(title_frame, text=f"Editar {type_.capitalize()}", font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack()
+        
+        # Card
+        card_frame = ctk.CTkScrollableFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        card_frame.pack(fill="both", expand=True)
+        
+        cmd_salvar = None
+
+        if type_ == "tarefa":
+            ctk.CTkLabel(card_frame, text="Área/Local:", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            entry_area = ctk.CTkEntry(card_frame, height=35)
+            entry_area.insert(0, row['area_local'])
+            entry_area.pack(pady=5, padx=15, fill="x")
+            
+            ctk.CTkLabel(card_frame, text="Tarefa:", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            entry_tarefa = ctk.CTkEntry(card_frame, height=35)
+            entry_tarefa.insert(0, row['tarefa'])
+            entry_tarefa.pack(pady=5, padx=15, fill="x")
+            
+            ctk.CTkLabel(card_frame, text="Prioridade:", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            prioridade_var = ctk.StringVar(value=row['prioridade'])
+            prioridade_combo = ctk.CTkComboBox(card_frame, values=["Baixa", "Média", "Alta"], variable=prioridade_var, state="readonly", height=35)
+            prioridade_combo.pack(pady=5, padx=15, fill="x")
+
+            ctk.CTkLabel(card_frame, text="Status:", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            status_var = ctk.StringVar(value=row['status'])
+            status_combo = ctk.CTkComboBox(card_frame, values=["Pendente", "Em Progresso", "Concluído"], variable=status_var, state="readonly", height=35)
+            status_combo.pack(pady=5, padx=15, fill="x")
+            
+            def salvar_tarefa():
+                area = entry_area.get().strip()
+                tarefa = entry_tarefa.get().strip()
+                prioridade = prioridade_var.get()
+                status = status_var.get()
+                
+                if not area or not tarefa:
+                    messagebox.showerror("Erro", "Preencha Área e Tarefa.", parent=dialog)
+                    dialog.lift()
+                    dialog.focus_force()
+                    return
+                
+                self.db.atualizar_tarefa_estabelecimento(row['id'], area, tarefa, prioridade, status)
+                messagebox.showinfo("Sucesso", "Tarefa atualizada!", parent=dialog)
+                dialog.destroy()
+                self.refresh_dashboard()
+            
+            cmd_salvar = salvar_tarefa
+
+        elif type_ == "gasto":
+            ctk.CTkLabel(card_frame, text="Valor (R$):", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            entry_valor = ctk.CTkEntry(card_frame, height=35)
+            entry_valor.insert(0, str(row['valor']).replace('.', ','))
+            entry_valor.pack(pady=5, padx=15, fill="x")
+            
+            ctk.CTkLabel(card_frame, text="Categoria:", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            cat_options = self.db.listar_categorias('gasto') or ["Material", "Transporte", "Serviços", "Aluguel", "Outro"]
+            cat_var = ctk.StringVar(value=row['categoria'])
+            cat_menu = ctk.CTkComboBox(card_frame, values=cat_options, variable=cat_var, state="readonly", height=35)
+            cat_menu.pack(pady=5, padx=15, fill="x")
+            
+            ctk.CTkLabel(card_frame, text="Descrição:", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            entry_desc = ctk.CTkEntry(card_frame, height=35)
+            entry_desc.insert(0, row['descricao'])
+            entry_desc.pack(pady=5, padx=15, fill="x")
+            
+            ctk.CTkLabel(card_frame, text="Data (YYYY-MM-DD):", font=ctk.CTkFont(family="Aileron", weight="bold", size=12), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            entry_data = ctk.CTkEntry(card_frame, height=35)
+            entry_data.insert(0, row['data'])
+            entry_data.pack(pady=5, padx=15, fill="x")
+            
+            def salvar_gasto():
+                valor = entry_valor.get().strip()
+                categoria = cat_var.get()
+                descricao = entry_desc.get().strip()
+                data = entry_data.get().strip()
+                
+                try:
+                    valor_clean = valor.replace("R$", "").replace(" ", "").replace(",", ".")
+                    valor_float = float(valor_clean)
+                    
+                    self.db.atualizar_gasto(row['id'], data, valor_float, categoria, descricao)
+                    messagebox.showinfo("Sucesso", "Gasto atualizado!", parent=dialog)
+                    dialog.destroy()
+                    self.refresh_dashboard()
+                except ValueError:
+                    messagebox.showerror("Erro", "Valor inválido.", parent=dialog)
+            
+            cmd_salvar = salvar_gasto
+
+        elif type_ == "produto":
+            ctk.CTkLabel(card_frame, text="Nome:", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            entry_nome = ctk.CTkEntry(card_frame, height=35)
+            entry_nome.insert(0, row['nome'])
+            entry_nome.pack(pady=5, padx=15, fill="x")
+            
+            ctk.CTkLabel(card_frame, text="Quantidade:", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            entry_qtd = ctk.CTkEntry(card_frame, height=35)
+            entry_qtd.insert(0, str(row['quantidade']))
+            entry_qtd.pack(pady=5, padx=15, fill="x")
+            
+            ctk.CTkLabel(card_frame, text="Categoria:", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            categoria_options = self.db.listar_categorias('produto') or ["Material", "Produto Pronto", "Insumo", "Outro"]
+            categoria_var = ctk.StringVar(value=row['categoria'])
+            categoria_menu = ctk.CTkComboBox(card_frame, values=categoria_options, variable=categoria_var, state="readonly", height=35)
+            categoria_menu.pack(pady=5, padx=15, fill="x")
+
+            # --- Seção de Precificação Ética ---
+            ctk.CTkLabel(card_frame, text="Precificação Ética", font=ctk.CTkFont(family="Aileron", size=14, weight="bold"), text_color=("#0A4174", "#7BBDE8")).pack(pady=(20, 10), padx=15, anchor="w")
+            
+            # Grid para campos numéricos
+            grid_frame = ctk.CTkFrame(card_frame, fg_color="transparent")
+            grid_frame.pack(fill="x", padx=10)
+            
+            # Coluna 1
+            ctk.CTkLabel(grid_frame, text="Horas Trab.:", font=("Aileron", 11, "bold")).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+            entry_horas = ctk.CTkEntry(grid_frame, width=100)
+            entry_horas.grid(row=1, column=0, padx=5, pady=5)
+            entry_horas.insert(0, str(row.get('horas_trabalho', 0)))
+            
+            ctk.CTkLabel(grid_frame, text="Valor Hora (R$):", font=("Aileron", 11, "bold")).grid(row=0, column=1, padx=5, pady=5, sticky="w")
+            entry_valor_hora = ctk.CTkEntry(grid_frame, width=100)
+            entry_valor_hora.grid(row=1, column=1, padx=5, pady=5)
+            entry_valor_hora.insert(0, str(row.get('valor_hora', 0.0)))
+            
+            # Coluna 2
+            ctk.CTkLabel(grid_frame, text="Margem Lucro (0-1):", font=("Aileron", 11, "bold")).grid(row=2, column=0, padx=5, pady=5, sticky="w")
+            entry_margem = ctk.CTkEntry(grid_frame, width=100)
+            entry_margem.grid(row=3, column=0, padx=5, pady=5)
+            entry_margem.insert(0, str(row.get('margem_lucro', 0.20)))
+
+            ctk.CTkLabel(card_frame, text="Preço de Venda (R$):", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            entry_preco = ctk.CTkEntry(card_frame, height=35)
+            entry_preco.insert(0, str(row['preco']).replace('.', ','))
+            entry_preco.pack(pady=5, padx=15, fill="x")
+
+            # --- Indicador de Lucro em Tempo Real ---
+            lbl_lucro_live = ctk.CTkLabel(card_frame, text="", font=("Aileron", 13, "bold"), text_color="#28a745")
+            lbl_lucro_live.pack(padx=15, pady=(0, 5))
+
+            def _atualizar_lucro_edit(*args):
+                try:
+                    custo_v = entry_custo_mat.get().strip().replace(",", ".")
+                    venda_v = entry_preco.get().strip().replace(",", ".")
+                    qtd_v = entry_qtd.get().strip()
+                    if not custo_v or not venda_v or not qtd_v:
+                        lbl_lucro_live.configure(text="")
+                        return
+                    custo_f = float(custo_v)
+                    venda_f = float(venda_v)
+                    qtd_f = int(qtd_v)
+                    if custo_f <= 0 and venda_f > 0:
+                        lbl_lucro_live.configure(text=f"Lucro unitário: R$ {venda_f:.2f} (sem custo informado)", text_color="#28a745")
+                        return
+                    if custo_f <= 0:
+                        lbl_lucro_live.configure(text="")
+                        return
+                    lucro_un = venda_f - custo_f
+                    lucro_total = lucro_un * qtd_f
+                    margem_pct = (lucro_un / venda_f) * 100 if venda_f > 0 else 0
+                    cor = "#28a745" if lucro_un >= 0 else "#FF6B6B"
+                    lbl_lucro_live.configure(
+                        text=f"Lucro unit: R$ {lucro_un:.2f} ({margem_pct:.1f}%)  |  Total estoque: R$ {lucro_total:.2f}",
+                        text_color=cor)
+                except (ValueError, TypeError):
+                    lbl_lucro_live.configure(text="")
+
+            entry_preco.bind("<KeyRelease>", _atualizar_lucro_edit)
+            entry_qtd.bind("<KeyRelease>", _atualizar_lucro_edit)
+
+            # --- Código de Barras ---
+            ctk.CTkLabel(card_frame, text="Código de Barras:", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            barcode_edit_frame = ctk.CTkFrame(card_frame, fg_color="transparent")
+            barcode_edit_frame.pack(padx=15, pady=5, fill="x")
+            entry_codigo_edit = ctk.CTkEntry(barcode_edit_frame, height=35)
+            current_code = row.get('codigo_barras', '') or row.get('codigo', '')
+            if current_code:  entry_codigo_edit.insert(0, current_code)
+            entry_codigo_edit.pack(side="left", fill="x", expand=True, padx=(0, 5))
+            # --------------------------------
+
+            # --- Lote / Nº de Série ---
+            ctk.CTkLabel(card_frame, text="Lote / Nº de Série:", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(pady=(10, 3), padx=15, anchor="w")
+            entry_lote_edit = ctk.CTkEntry(card_frame, height=35, placeholder_text="Lote, IMEI, SIF...")
+            current_lote = row.get('lote_serie', '') or ''
+            if current_lote:  entry_lote_edit.insert(0, current_lote)
+            entry_lote_edit.pack(padx=15, pady=(0, 5), fill="x")
+            # --------------------------------
+
+            # --- Seção de Imagem (Update) ---
+            ctk.CTkLabel(card_frame, text="Imagem do Produto:", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            
+            self.temp_image_path = None # Para edição
+            current_img = row.get('imagem')
+            
+            img_display_text = current_img if current_img else "Sem imagem"
+            lbl_img_path = ctk.CTkLabel(card_frame, text=img_display_text, font=ctk.CTkFont(family="Aileron", size=11, slant="italic"), text_color="gray")
+            lbl_img_path.pack(pady=2, padx=15, anchor="w")
+            
+            def alterar_imagem():
+                dialog.attributes("-topmost", False)
+                file_path = filedialog.askopenfilename(title="Selecionar Imagem", filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.gif")])
+                dialog.attributes("-topmost", True)
+                if file_path:
+                    self.temp_image_path = file_path
+                    lbl_img_path.configure(text=os.path.basename(file_path))
+                    dialog.lift()
+
+            ctk.CTkButton(card_frame, text="Alterar Imagem", command=alterar_imagem, height=30,
+                        fg_color="#5DADE2", text_color="#001D39", hover_color="#3498DB",
+                        font=("Aileron", 11, "bold")).pack(pady=5, padx=15, fill="x")
+
+            def calcular_sugestao():
+                try:
+                    custo_mat = float(entry_custo_mat.get().replace(',', '.'))
+                    horas = float(entry_horas.get().replace(',', '.'))
+                    v_hora = float(entry_valor_hora.get().replace(',', '.'))
+                    margem = float(entry_margem.get().replace(',', '.'))
+                    
+                    engine = ai_module.PricingEngine()
+                    resultado = engine.calcular_preco_etico(custo_mat, horas, v_hora, margem, 0.0, 1.0)
+                    
+                    entry_preco.delete(0, "end")
+                    entry_preco.insert(0, f"{resultado['preco_sugerido']:.2f}")
+                    _atualizar_lucro_edit()
+                    messagebox.showinfo("Cálculo Realizado", f"Preço Sugerido: R$ {resultado['preco_sugerido']:.2f}\n\nDetalhes:\n{resultado['detalhes']}", parent=dialog)
+                except ValueError:
+                    messagebox.showerror("Erro", "Verifique se todos os campos numéricos estão preenchidos corretamente.", parent=dialog)
+
+            ctk.CTkLabel(grid_frame, text="Custo Material (R$):", font=("Aileron", 11, "bold")).grid(row=2, column=1, padx=5, pady=5, sticky="w")
+            entry_custo_mat = ctk.CTkEntry(grid_frame, width=100)
+            entry_custo_mat.grid(row=3, column=1, padx=5, pady=5)
+            entry_custo_mat.insert(0, str(row.get('preco_compra', 0.0) or 0.0))
+
+            # Bind custo ao indicador de lucro
+            entry_custo_mat.bind("<KeyRelease>", _atualizar_lucro_edit)
+            _atualizar_lucro_edit()
+
+            ctk.CTkButton(card_frame, text="Calcular Preço Sugerido", command=calcular_sugestao, fg_color="#5DADE2", text_color="#001D39", height=30).pack(pady=10, padx=15, fill="x")
+            
+            def salvar_produto():
+                nome = entry_nome.get().strip()
+                qtd = entry_qtd.get().strip()
+                preco = entry_preco.get().strip()
+                categoria = categoria_var.get()
+                codigo_barras_final = entry_codigo_edit.get().strip()
+                lote_serie_final = entry_lote_edit.get().strip()
+                
+                try:
+                    qtd_int = int(qtd)
+                    preco_float = float(preco.replace(',', '.'))
+                    novo_custo = float(entry_custo_mat.get().replace(',', '.'))
+                    
+                    # Novos campos
+                    horas = float(entry_horas.get().replace(',', '.'))
+                    v_hora = float(entry_valor_hora.get().replace(',', '.'))
+                    margem = float(entry_margem.get().replace(',', '.'))
+
+                    # Processar Imagem Nova
+                    imagem_final = row.get('imagem') # Manter a antiga se não houver mudança
+                    if self.temp_image_path:
+                        
+                        img_dir = os.path.join(self.db.data_dir, "product_images")
+                        if not os.path.exists(img_dir): os.makedirs(img_dir)
+                        
+                        ext = os.path.splitext(self.temp_image_path)[1]
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                        nome_seguro = "".join([c for c in nome if c.isalnum() or c in (' ', '-', '_')]).strip()
+                        novo_nome = f"prod_{nome_seguro}_{timestamp}{ext}"
+                        dest_path = os.path.join(img_dir, novo_nome)
+                        
+                        try:
+                            shutil.copy2(self.temp_image_path, dest_path)
+                            imagem_final = novo_nome
+                        except Exception as e:
+                            logger.warning("Erro ao copiar imagem: %s", e)
+
+                    # Atualizar preco_compra no banco
+                    old_custo = float(row.get('preco_compra', 0) or 0)
+                    old_preco = float(row.get('preco', 0) or 0)
+                    old_qtd = int(row.get('quantidade', 0) or 0)
+
+                    self.db.atualizar_produto(row['id'], nome, qtd_int, preco_float, categoria, horas, v_hora, margem, 0.0, 1.0, imagem=imagem_final, codigo_barras=codigo_barras_final, lote_serie=lote_serie_final)
+
+                    # Atualizar preco_compra separadamente
+                    try:
+                        cursor = self.db.conn.cursor()
+                        cursor.execute("UPDATE produtos SET preco_compra = ? WHERE id = ?", (novo_custo, row['id']))
+                        self.db.conn.commit()
+                    except Exception:
+                        pass
+
+                    # Registrar impacto financeiro se houve mudança significativa
+                    mudancas = []
+                    if abs(novo_custo - old_custo) > 0.01:
+                        mudancas.append(f"Custo: R$ {old_custo:.2f} → R$ {novo_custo:.2f}")
+                    if abs(preco_float - old_preco) > 0.01:
+                        mudancas.append(f"Preço venda: R$ {old_preco:.2f} → R$ {preco_float:.2f}")
+                    if qtd_int != old_qtd:
+                        mudancas.append(f"Estoque: {old_qtd} → {qtd_int}")
+
+                    if mudancas:
+                        self.db.registrar_alteracao("Editar Produto (Financeiro)", f"'{nome}': {'; '.join(mudancas)}")
+
+                    # Se quantidade aumentou e custo > 0, registrar gasto de reposição
+                    if qtd_int > old_qtd and novo_custo > 0:
+                        qtd_adicionada = qtd_int - old_qtd
+                        gasto_reposicao = qtd_adicionada * novo_custo
+                        self.db.adicionar_gasto(
+                            datetime.date.today().isoformat(),
+                            gasto_reposicao,
+                            "Reposição de Estoque",
+                            f"Reposição: +{qtd_adicionada}x {nome} (R$ {novo_custo:.2f}/un)"
+                        )
+
+                    messagebox.showinfo("Sucesso", "Produto atualizado!", parent=dialog)
+                    dialog.destroy()
+                    self.refresh_dashboard()
+                except ValueError:
+                    messagebox.showerror("Erro", "Valores inválidos.", parent=dialog)
+            
+            cmd_salvar = salvar_produto
+
+        # Botão Salvar
+        if cmd_salvar:
+            button_frame = ctk.CTkFrame(card_frame, fg_color="transparent")
+            button_frame.pack(pady=20, padx=15, fill="x")
+            ctk.CTkButton(button_frame, text="Salvar Alterações", command=cmd_salvar, height=40,
+                        fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F",
+                        font=("Aileron", 14, "bold")).pack(fill="x")
+
+    def open_gasto_manager(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Gestão de Gastos")
+        window.geometry("700x650")
+        window.attributes("-topmost", True)
+        window.grab_set()
+
+        # Frame principal
+        main_frame = ctk.CTkFrame(window, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        # Cabeçalho
+        ctk.CTkLabel(main_frame, text="Gestão de Gastos", font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 20))
+
+        # Adicionar Gasto Frame
+        add_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        add_frame.pack(fill="x", pady=(0, 20))
+        
+        ctk.CTkLabel(add_frame, text="Novo Gasto", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(pady=(10, 5), padx=15, anchor="w")
+
+        # Grid para inputs
+        grid = ctk.CTkFrame(add_frame, fg_color="transparent")
+        grid.pack(fill="x", padx=10, pady=5)
+
+        ctk.CTkLabel(grid, text="Valor (R$):", text_color=("#001D39", "white")).grid(row=0, column=0, ipady=5, sticky="w")
+        entry_val = ctk.CTkEntry(grid, width=100)
+        entry_val.grid(row=1, column=0, padx=5)
+
+        ctk.CTkLabel(grid, text="Data (YYYY-MM-DD):", text_color=("#001D39", "white")).grid(row=0, column=1, ipady=5, sticky="w")
+        entry_date = ctk.CTkEntry(grid, width=120)
+        entry_date.insert(0, datetime.date.today().isoformat())
+        entry_date.grid(row=1, column=1, padx=5)
+        
+        ctk.CTkLabel(grid, text="Categoria:", text_color=("#001D39", "white")).grid(row=0, column=2, ipady=5, sticky="w")
+        cat_var = ctk.StringVar(value="Material")
+        gasto_cats = self.db.listar_categorias('gasto') or ["Material", "Transporte", "Serviços", "Aluguel", "Outro"]
+        cat_menu = ctk.CTkComboBox(grid, values=gasto_cats, variable=cat_var, width=120)
+        cat_menu.grid(row=1, column=2, padx=5)
+
+        ctk.CTkLabel(add_frame, text="Descrição:", font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).pack(pady=(5, 0), padx=15, anchor="w")
+        entry_desc = ctk.CTkEntry(add_frame)
+        entry_desc.pack(fill="x", padx=15, pady=5)
+
+        def add_gasto():
+            try:
+                val = float(entry_val.get().replace(",", "."))
+                date = entry_date.get().strip()
+                
+                # Validação de data
+                try:
+                    datetime.date.fromisoformat(date)
+                except ValueError:
+                    messagebox.showerror("Erro", "Data inválida. Use o formato YYYY-MM-DD (ex: 2026-02-28).", parent=window)
+                    return
+                
+                cat = cat_var.get()
+                desc = entry_desc.get().strip()
+                self.db.adicionar_gasto(date, val, cat, desc)
+                messagebox.showinfo("Sucesso", "Gasto registrado!", parent=window)
+                entry_val.delete(0, "end")
+                entry_desc.delete(0, "end")
+                refresh_gastos()
+                self.refresh_dashboard()
+            except ValueError:
+                messagebox.showerror("Erro", "Valor inválido.", parent=window)
+
+        ctk.CTkButton(add_frame, text="Adicionar Gasto", command=add_gasto, fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F").pack(pady=10, padx=15, fill="x")
+
+        # Lista Gastos
+        list_frame = ctk.CTkScrollableFrame(main_frame, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        list_frame.pack(fill="both", expand=True)
+
+        def refresh_gastos():
+            for w in list_frame.winfo_children(): w.destroy()
+            df = self.db.listar_gastos()
+            if df.empty:
+                ctk.CTkLabel(list_frame, text="Nenhum gasto registrado.", text_color=("#999999", "#AAAAAA")).pack(pady=20)
+            else:
+                # Mostrar últimos primeiro
+                df = df.iloc[::-1]
+                for idx, row in df.iterrows():
+                    f = ctk.CTkFrame(list_frame, fg_color=("white", "#404040"))
+                    f.pack(fill="x", pady=2, padx=5)
+                    txt = f"{row['data']} - {row['categoria']}: R$ {row['valor']:.2f} ({row['descricao']})"
+                    ctk.CTkLabel(f, text=txt, anchor="w", text_color=("#333333", "white")).pack(side="left", padx=10)
+                    
+                    def del_g(gasto_id=row['id']):
+                        if messagebox.askyesno("Confirmar", "Deletar gasto?", parent=window):
+                            self.db.remover_gasto(gasto_id)
+                            refresh_gastos()
+                            self.refresh_dashboard()
+
+                    ctk.CTkButton(f, text="X", width=30, fg_color="red", command=del_g).pack(side="right", padx=5, pady=5)
+
+        refresh_gastos()
+
+    def open_add_product_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Adicionar Novo Produto")
+        dialog.geometry("750x850")
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+
+        main_frame = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        ctk.CTkLabel(main_frame, text="Gestão de Produtos", font=("Aileron", 20, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 10))
+
+        # Botão de importação CSV
+        ctk.CTkButton(main_frame, text="📂 Importar Produtos (CSV/PDF)", command=lambda: (dialog.destroy(), self.open_importar_csv()),
+                        height=35, fg_color=("#EBEBF0", "#3A3A3A"), text_color=("#333", "white"),
+                        hover_color=("#D9D9E0", "#4A4A4A"), font=("Aileron", 11)).pack(fill="x", pady=(0, 15))
+
+        # ===== CARD PRINCIPAL: ADICIONAR AO PRODUTO EXISTENTE (PRIMEIRO!) =====
+        existing_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15, border_width=2, border_color="#0A4174")
+        existing_card.pack(fill="x", pady=(0, 20))
+
+        # Header com destaque
+        exist_header = ctk.CTkFrame(existing_card, fg_color="#0A4174", corner_radius=12, height=45)
+        exist_header.pack(fill="x", padx=3, pady=(3, 0))
+        exist_header.pack_propagate(False)
+        ctk.CTkLabel(exist_header, text="📦  Adicionar Estoque a Produto Existente", font=("Aileron", 15, "bold"), text_color="white").pack(pady=10, padx=15, anchor="w")
+
+        ctk.CTkLabel(existing_card, text="Filtre por categoria e selecione o produto para reabastecer:", font=("Aileron", 11, "italic"), text_color=("gray40", "gray70")).pack(padx=15, pady=(10, 5), anchor="w")
+
+        # Filtros: Categoria + Subcategoria
+        filter_frame = ctk.CTkFrame(existing_card, fg_color="transparent")
+        filter_frame.pack(fill="x", padx=15, pady=5)
+        filter_frame.columnconfigure(0, weight=1)
+        filter_frame.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(filter_frame, text="Categoria:", font=("Aileron", 11, "bold")).grid(row=0, column=0, sticky="w", padx=5)
+        exist_cats = ["Todas"] + (self.db.listar_categorias('produto') or [])
+        combo_cat_filter = ctk.CTkComboBox(filter_frame, values=exist_cats, state="readonly")
+        combo_cat_filter.set("Todas")
+        combo_cat_filter.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
+
+        ctk.CTkLabel(filter_frame, text="Subcategoria:", font=("Aileron", 11, "bold")).grid(row=0, column=1, sticky="w", padx=5)
+        combo_subcat_filter = ctk.CTkComboBox(filter_frame, values=["Todas"], state="readonly")
+        combo_subcat_filter.set("Todas")
+        combo_subcat_filter.grid(row=1, column=1, sticky="ew", padx=5, pady=(0, 5))
+
+        # Busca por nome
+        ctk.CTkLabel(existing_card, text="Buscar:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=20, pady=(5, 0))
+        e_busca_exist = ctk.CTkEntry(existing_card, height=35, placeholder_text="🔍 Digite o nome ou código do produto...")
+        e_busca_exist.pack(fill="x", padx=20, pady=(2, 5))
+
+        # Lista de produtos filtrada
+        exist_list_frame = ctk.CTkScrollableFrame(existing_card, fg_color=("#F5F5F5", "#333333"), corner_radius=10, height=150)
+        exist_list_frame.pack(fill="x", padx=15, pady=5)
+
+        selected_exist_product = {"id": None, "nome": None, "row": None}
+
+        try:
+            df_exist = self.db.listar_produtos()
+        except Exception:
+            df_exist = pd.DataFrame()
+
+        def _filtrar_produtos(*args):
+            for w in exist_list_frame.winfo_children():
+                w.destroy()
+            selected_exist_product["id"] = None
+            selected_exist_product["nome"] = None
+            selected_exist_product["row"] = None
+
+            if df_exist.empty:
+                ctk.CTkLabel(exist_list_frame, text="Nenhum produto cadastrado.", text_color="gray").pack(pady=10)
+                return
+
+            cat_filtro = combo_cat_filter.get()
+            subcat_filtro = combo_subcat_filter.get()
+            busca = e_busca_exist.get().strip().lower()
+
+            filtered = df_exist.copy()
+            if cat_filtro != "Todas":
+                filtered = filtered[filtered['categoria'] == cat_filtro]
+            if subcat_filtro != "Todas" and 'subcategoria' in filtered.columns:
+                filtered = filtered[filtered['subcategoria'] == subcat_filtro]
+            if busca:
+                mask = filtered['nome'].str.lower().str.contains(busca, na=False)
+                if 'codigo_barras' in filtered.columns:
+                    mask = mask | filtered['codigo_barras'].fillna('').str.lower().str.contains(busca, na=False)
+                filtered = filtered[mask]
+
+            if filtered.empty:
+                ctk.CTkLabel(exist_list_frame, text="Nenhum produto encontrado com esses filtros.", text_color="gray").pack(pady=10)
+                return
+
+            for _, prod_row in filtered.iterrows():
+                item_frame = ctk.CTkFrame(exist_list_frame, fg_color=("white", "#404040"), corner_radius=8, height=40)
+                item_frame.pack(fill="x", pady=2, padx=3)
+                item_frame.pack_propagate(False)
+
+                # Thumbnail
+                icon_img = None
+                if 'imagem' in prod_row and prod_row['imagem']:
+                    try:
+                        img_p = os.path.join(self.db.data_dir, "product_images", prod_row['imagem'])
+                        if os.path.exists(img_p):
+                            pil_img = Image.open(img_p)
+                            icon_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(28, 28))
+                    except Exception:
+                        pass
+
+                cat_txt = f" [{prod_row['categoria']}]" if prod_row.get('categoria') else ""
+                estoque_cor = "#28a745" if prod_row['quantidade'] > 5 else ("#E67E22" if prod_row['quantidade'] > 0 else "#FF6B6B")
+                display_text = f"{prod_row['nome']}{cat_txt}  •  Estoque: {prod_row['quantidade']}  •  R$ {prod_row['preco']:.2f}"
+
+                def _selecionar(pid=prod_row['id'], pnome=prod_row['nome'], prow=prod_row, frame=item_frame):
+                    selected_exist_product["id"] = pid
+                    selected_exist_product["nome"] = pnome
+                    selected_exist_product["row"] = prow
+                    lbl_selecionado.configure(text=f"✅ Selecionado: {pnome}", text_color="#28a745")
+                    # Reset visual de todos
+                    for child in exist_list_frame.winfo_children():
+                        if isinstance(child, ctk.CTkFrame):
+                            child.configure(fg_color=("white", "#404040"))
+                    frame.configure(fg_color=("#D6EAF8", "#1A3A5C"))
+
+                btn = ctk.CTkButton(item_frame, text=display_text, image=icon_img, compound="left",
+                                    fg_color="transparent", hover_color=("#D6EAF8", "#1A3A5C"),
+                                    text_color=(estoque_cor, "white"), anchor="w", font=("Aileron", 11),
+                                    command=_selecionar)
+                btn.pack(fill="both", expand=True, padx=3, pady=2)
+
+        def _atualizar_subcat_filter(*args):
+            cat_sel = combo_cat_filter.get()
+            if cat_sel == "Todas":
+                combo_subcat_filter.configure(values=["Todas"])
+            else:
+                subcats = self.db.listar_subcategorias(cat_sel, 'produto')
+                combo_subcat_filter.configure(values=["Todas"] + (subcats or []))
+            combo_subcat_filter.set("Todas")
+            _filtrar_produtos()
+
+        combo_cat_filter.configure(command=lambda v: _atualizar_subcat_filter())
+        combo_subcat_filter.configure(command=lambda v: _filtrar_produtos())
+        e_busca_exist.bind("<KeyRelease>", _filtrar_produtos)
+        _filtrar_produtos()
+
+        lbl_selecionado = ctk.CTkLabel(existing_card, text="Nenhum produto selecionado", font=("Aileron", 11, "italic"), text_color=("gray40", "gray70"))
+        lbl_selecionado.pack(padx=15, pady=(5, 0))
+
+        # Quantidade + Botão
+        exist_action_frame = ctk.CTkFrame(existing_card, fg_color="transparent")
+        exist_action_frame.pack(fill="x", padx=15, pady=(5, 10))
+        exist_action_frame.columnconfigure(0, weight=1)
+        exist_action_frame.columnconfigure(1, weight=2)
+
+        ctk.CTkLabel(exist_action_frame, text="Qtd a adicionar:", font=("Aileron", 11, "bold")).grid(row=0, column=0, sticky="w", padx=5)
+        e_add_qtd = ctk.CTkEntry(exist_action_frame, placeholder_text="0", height=38)
+        e_add_qtd.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
+
+        def _adicionar_ao_existente():
+            if not selected_exist_product["id"]:
+                messagebox.showerror("Erro", "Selecione um produto da lista.", parent=dialog)
+                return
+            try:
+                qtd_add = int(e_add_qtd.get())
+                if qtd_add <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Erro", "Informe uma quantidade válida.", parent=dialog)
+                return
+            try:
+                prod_row = selected_exist_product["row"]
+                nova_qtd = int(prod_row['quantidade']) + qtd_add
+                self.db.atualizar_produto(
+                    int(prod_row['id']), prod_row['nome'], nova_qtd, prod_row['preco'], prod_row['categoria'],
+                    prod_row.get('horas_trabalho', 0), prod_row.get('valor_hora', 0),
+                    margem_lucro=prod_row.get('margem_lucro', 0.20),
+                    fator_risco=prod_row.get('fator_risco', 0.10),
+                    fator_raridade=prod_row.get('fator_raridade', 1.0),
+                    imagem=prod_row.get('imagem'), codigo_barras=prod_row.get('codigo_barras')
+                )
+                messagebox.showinfo("Sucesso", f"+{qtd_add} unidades adicionadas a '{selected_exist_product['nome']}'!\nNovo estoque: {nova_qtd}", parent=dialog)
+                e_add_qtd.delete(0, "end")
+                # Recarregar lista
+                nonlocal df_exist
+                try:
+                    df_exist = self.db.listar_produtos()
+                except Exception:
+                    pass
+                _filtrar_produtos()
+                self.refresh_dashboard()
+            except Exception as e:
+                messagebox.showerror("Erro", f"Falha ao atualizar: {e}", parent=dialog)
+
+        ctk.CTkButton(exist_action_frame, text="⬆ ADICIONAR AO ESTOQUE", command=_adicionar_ao_existente,
+                      height=38, fg_color="#0A4174", hover_color="#062F56", text_color="white",
+                      font=("Aileron", 12, "bold")).grid(row=1, column=1, sticky="ew", padx=5, pady=(0, 5))
+
+        # ===== SEPARADOR =====
+        sep_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        sep_frame.pack(fill="x", pady=5)
+        ctk.CTkFrame(sep_frame, height=2, fg_color=("#CCCCCC", "#555555")).pack(fill="x", padx=20)
+        ctk.CTkLabel(sep_frame, text="─ ou cadastre um novo produto ─", font=("Aileron", 11), text_color=("gray50", "gray60")).pack(pady=5)
+
+        # --- Cards ---
+        basic_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        basic_card.pack(fill="x", pady=(0, 15))
+        
+        pricing_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        pricing_card.pack(fill="x", pady=(0, 15))
+
+        # --- BASIC INFO ---
+        ctk.CTkLabel(basic_card, text="Informações Básicas", font=("Aileron", 14, "bold"), text_color="#7BBDE8").pack(pady=10, padx=15, anchor="w")
+        
+        entries = {}
+        
+        # Grid layout for basic info
+        grid_basic = ctk.CTkFrame(basic_card, fg_color="transparent")
+        grid_basic.pack(fill="x", padx=10, pady=5)
+        
+        # Nome (Full width)
+        ctk.CTkLabel(grid_basic, text="Nome do Produto:", font=("Aileron", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=5)
+        e_nome = ctk.CTkEntry(grid_basic, width=400)
+        e_nome.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(0, 10))
+        entries["Nome"] = e_nome
+
+        # Barcode (New)
+        ctk.CTkLabel(grid_basic, text="Código de Barras (Leitor):", font=("Aileron", 11, "bold")).grid(row=2, column=0, sticky="w", padx=5)
+        e_barcode = ctk.CTkEntry(grid_basic, placeholder_text="Scaneie aqui...")
+        e_barcode.grid(row=3, column=0, sticky="ew", padx=5, pady=(0, 10))
+        entries["Codigo"] = e_barcode
+        
+        # Lote/Série (rastreabilidade)
+        ctk.CTkLabel(grid_basic, text="Lote/Nº de Série:", font=("Aileron", 11, "bold")).grid(row=2, column=1, sticky="w", padx=5)
+        e_lote = ctk.CTkEntry(grid_basic, placeholder_text="Lote, IMEI, SIF...")
+        e_lote.grid(row=3, column=1, sticky="ew", padx=5, pady=(0, 10))
+        entries["Lote"] = e_lote
+        
+        # Qtd & Categoria
+        ctk.CTkLabel(grid_basic, text="Quantidade:", font=("Aileron", 11, "bold")).grid(row=4, column=0, sticky="w", padx=5)
+        e_qtd = ctk.CTkEntry(grid_basic)
+        e_qtd.grid(row=5, column=0, sticky="ew", padx=5, pady=(0, 10))
+        entries["Quantidade"] = e_qtd
+        
+        ctk.CTkLabel(grid_basic, text="Categoria:", font=("Aileron", 11, "bold")).grid(row=4, column=1, sticky="w", padx=5)
+        produto_cats = self.db.listar_categorias('produto') or ["Produto Pronto", "Material", "Insumo", "Outro"]
+        e_cat = ctk.CTkComboBox(grid_basic, values=produto_cats)
+        e_cat.grid(row=5, column=1, sticky="ew", padx=5, pady=(0, 10))
+        entries["Categoria"] = e_cat
+
+        ctk.CTkLabel(grid_basic, text="Estoque Mínimo:", font=("Aileron", 11, "bold")).grid(row=6, column=0, sticky="w", padx=5)
+        e_estoque_min = ctk.CTkEntry(grid_basic, placeholder_text="5")
+        e_estoque_min.insert(0, "5")
+        e_estoque_min.grid(row=7, column=0, sticky="ew", padx=5, pady=(0, 10))
+        entries["EstoqueMinimo"] = e_estoque_min
+
+        # Preço de Compra (visível para todas as modalidades)
+        ctk.CTkLabel(grid_basic, text="Preço de Compra (R$):", font=("Aileron", 11, "bold")).grid(row=6, column=1, sticky="w", padx=5)
+        e_preco_compra = ctk.CTkEntry(grid_basic, placeholder_text="0.00")
+        e_preco_compra.grid(row=7, column=1, sticky="ew", padx=5, pady=(0, 10))
+        entries["PrecoCompra"] = e_preco_compra
+
+        # Preço de Venda (ao lado do Preço de Compra)
+        ctk.CTkLabel(grid_basic, text="Preço de Venda (R$):", font=("Aileron", 11, "bold")).grid(row=8, column=0, sticky="w", padx=5)
+        e_preco = ctk.CTkEntry(grid_basic, placeholder_text="0.00")
+        e_preco.grid(row=9, column=0, sticky="ew", padx=5, pady=(0, 10))
+        entries["Preço Venda"] = e_preco
+
+        # Tipo de Produto e Sob Encomenda (condicional por tipo de negócio)
+        e_tipo_produto = None
+        e_sob_encomenda = None
+        next_row = 10
+        if self.business_type in ("padaria_acougue", "artesanato"):
+            ctk.CTkLabel(grid_basic, text="Tipo de Produto:", font=("Aileron", 11, "bold")).grid(row=next_row, column=0, sticky="w", padx=5)
+            e_tipo_produto = ctk.CTkComboBox(grid_basic, values=["produto", "insumo"], state="readonly")
+            e_tipo_produto.set("produto")
+            e_tipo_produto.grid(row=next_row+1, column=0, sticky="ew", padx=5, pady=(0, 10))
+            next_row += 2
+        if self.business_type == "artesanato":
+            ctk.CTkLabel(grid_basic, text="Sob Encomenda:", font=("Aileron", 11, "bold")).grid(row=next_row-2, column=1, sticky="w", padx=5)
+            e_sob_encomenda = ctk.CTkComboBox(grid_basic, values=["Não", "Sim"], state="readonly")
+            e_sob_encomenda.set("Não")
+            e_sob_encomenda.grid(row=next_row-1, column=1, sticky="ew", padx=5, pady=(0, 10))
+
+        # Subcategoria (dinâmica baseada na categoria selecionada)
+        ctk.CTkLabel(grid_basic, text="Subcategoria:", font=("Aileron", 11, "bold")).grid(row=next_row, column=0, sticky="w", padx=5)
+        e_subcat = ctk.CTkComboBox(grid_basic, values=["(nenhuma)"])
+        e_subcat.grid(row=next_row+1, column=0, sticky="ew", padx=5, pady=(0, 10))
+        entries["Subcategoria"] = e_subcat
+
+        # Tamanho (dinâmico baseado na subcategoria)
+        ctk.CTkLabel(grid_basic, text="Tamanho:", font=("Aileron", 11, "bold")).grid(row=next_row, column=1, sticky="w", padx=5)
+        e_tamanho = ctk.CTkComboBox(grid_basic, values=["(nenhum)"])
+        e_tamanho.grid(row=next_row+1, column=1, sticky="ew", padx=5, pady=(0, 10))
+        entries["Tamanho"] = e_tamanho
+
+        # Sub-subcategoria (dinâmica baseada na subcategoria)
+        ctk.CTkLabel(grid_basic, text="Sub-Subcategoria:", font=("Aileron", 11, "bold")).grid(row=next_row+2, column=0, sticky="w", padx=5)
+        e_sub_subcat = ctk.CTkComboBox(grid_basic, values=["(nenhuma)"])
+        e_sub_subcat.grid(row=next_row+3, column=0, sticky="ew", padx=5, pady=(0, 10))
+        entries["SubSubcategoria"] = e_sub_subcat
+
+        def _atualizar_subcategorias(*args):
+            cat_sel = e_cat.get()
+            subcats = self.db.listar_subcategorias(cat_sel, 'produto')
+            if subcats:
+                e_subcat.configure(values=["(nenhuma)"] + subcats)
+            else:
+                e_subcat.configure(values=["(nenhuma)"])
+            e_subcat.set("(nenhuma)")
+            e_tamanho.configure(values=["(nenhum)"])
+            e_tamanho.set("(nenhum)")
+            e_sub_subcat.configure(values=["(nenhuma)"])
+            e_sub_subcat.set("(nenhuma)")
+
+        def _atualizar_tamanhos(*args):
+            cat_sel = e_cat.get()
+            sub_sel = e_subcat.get()
+            if sub_sel and sub_sel != "(nenhuma)":
+                tams = self.db.listar_tamanhos(cat_sel, sub_sel, 'produto')
+                if tams:
+                    e_tamanho.configure(values=["(nenhum)"] + tams)
+                else:
+                    e_tamanho.configure(values=["(nenhum)"])
+                # Atualizar sub-subcategorias
+                sub_subs = self.db.listar_sub_subcategorias(cat_sel, sub_sel, 'produto')
+                if sub_subs:
+                    e_sub_subcat.configure(values=["(nenhuma)"] + sub_subs)
+                else:
+                    e_sub_subcat.configure(values=["(nenhuma)"])
+            else:
+                e_tamanho.configure(values=["(nenhum)"])
+                e_sub_subcat.configure(values=["(nenhuma)"])
+            e_tamanho.set("(nenhum)")
+            e_sub_subcat.set("(nenhuma)")
+
+        e_cat.configure(command=lambda val: _atualizar_subcategorias())
+        e_subcat.configure(command=lambda val: _atualizar_tamanhos())
+        _atualizar_subcategorias()
+
+        # --- Calculadora de Lucro ao Vivo ---
+        lbl_live_margin = ctk.CTkLabel(basic_card, text="", font=("Aileron", 12, "bold"), text_color="#28a745")
+        lbl_live_margin.pack(padx=15, pady=(0, 5), anchor="w")
+
+        def _calcular_margem_live(*args):
+            try:
+                custo_v = e_preco_compra.get().strip().replace(",", ".")
+                venda_v = e_preco.get().strip().replace(",", ".")
+                if not custo_v or not venda_v:
+                    lbl_live_margin.configure(text="")
+                    return
+                custo_f = float(custo_v)
+                venda_f = float(venda_v)
+                if custo_f <= 0:
+                    lbl_live_margin.configure(text="")
+                    return
+                lucro = venda_f - custo_f
+                margem_pct = (lucro / venda_f) * 100 if venda_f > 0 else 0
+                markup_pct = (lucro / custo_f) * 100
+                cor = "#28a745" if lucro >= 0 else "#FF6B6B"
+                lbl_live_margin.configure(
+                    text=f"💰 Lucro: R$ {lucro:.2f}  |  Margem: {margem_pct:.1f}%  |  Markup: {markup_pct:.1f}%",
+                    text_color=cor
+                )
+            except ValueError:
+                lbl_live_margin.configure(text="")
+
+        e_preco_compra.bind("<KeyRelease>", _calcular_margem_live)
+        e_preco.bind("<KeyRelease>", _calcular_margem_live)
+
+        # Imagem
+        self.temp_image_path = None
+        lbl_img = ctk.CTkLabel(basic_card, text="Sem imagem selecionada", font=("Aileron", 10, "italic"))
+        lbl_img.pack(pady=5)
+        
+        def pick_img():
+            dialog.attributes("-topmost", False) # Necessário para dialog file
+            p = filedialog.askopenfilename(filetypes=[("Imagens", "*.png *.jpg *.jpeg")])
+            dialog.attributes("-topmost", True)
+            if p:
+                self.temp_image_path = p
+                lbl_img.configure(text=os.path.basename(p))
+                dialog.lift()
+
+        ctk.CTkButton(basic_card, text="Selecionar Imagem", command=pick_img, fg_color="#5DADE2", text_color="#001D39", height=30).pack(fill="x", padx=15, pady=(0, 15))
+
+        # --- UNIDADE DE MEDIDA (Padaria/Açougue) ---
+        e_unidade = None
+        e_preco_peso = None
+        if self.business_type == "padaria_acougue":
+            weight_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+            weight_card.pack(fill="x", pady=(0, 15))
+            ctk.CTkLabel(weight_card, text="Venda por Peso", font=("Aileron", 14, "bold"), text_color="#D4A373").pack(pady=10, padx=15, anchor="w")
+            ctk.CTkLabel(weight_card, text="Configure a unidade de medida e preço por peso:", font=("Aileron", 10, "italic"), text_color="gray").pack(padx=15, anchor="w")
+            w_grid = ctk.CTkFrame(weight_card, fg_color="transparent")
+            w_grid.pack(fill="x", padx=15, pady=10)
+            w_grid.columnconfigure(0, weight=1)
+            w_grid.columnconfigure(1, weight=1)
+            ctk.CTkLabel(w_grid, text="Unidade de Medida:", font=("Aileron", 11, "bold")).grid(row=0, column=0, sticky="w", padx=5)
+            e_unidade = ctk.CTkComboBox(w_grid, values=["un", "kg", "g", "L", "mL"], state="readonly")
+            e_unidade.set("un")
+            e_unidade.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 10))
+            ctk.CTkLabel(w_grid, text="Preço por Kg (R$):", font=("Aileron", 11, "bold")).grid(row=0, column=1, sticky="w", padx=5)
+            e_preco_peso = ctk.CTkEntry(w_grid, placeholder_text="0.00")
+            e_preco_peso.grid(row=1, column=1, sticky="ew", padx=5, pady=(0, 10))
+
+        # --- ESTOQUE POR TAMANHO (P/M/G/GG) — somente Loja de Roupas ---
+        size_entries = {}
+        if self.business_type in ("loja_roupa",):
+            size_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+            size_card.pack(fill="x", pady=(0, 15))
+
+            ctk.CTkLabel(size_card, text="Controle de Estoque por Tamanho", font=("Aileron", 14, "bold"), text_color="#7BBDE8").pack(pady=10, padx=15, anchor="w")
+            ctk.CTkLabel(size_card, text="(Opcional - preencha se o produto tem variações de tamanho)", font=("Aileron", 10, "italic"), text_color="gray").pack(padx=15, anchor="w")
+
+            size_grid = ctk.CTkFrame(size_card, fg_color="transparent")
+            size_grid.pack(fill="x", padx=15, pady=10)
+
+            for col_idx, size_label in enumerate(["P", "M", "G", "GG"]):
+                ctk.CTkLabel(size_grid, text=size_label, font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).grid(row=0, column=col_idx, padx=10, pady=(0, 5))
+                e_size = ctk.CTkEntry(size_grid, width=60, placeholder_text="0", justify="center")
+                e_size.insert(0, "0")
+                e_size.grid(row=1, column=col_idx, padx=10, pady=(0, 10))
+                size_entries[size_label] = e_size
+
+        # --- SEÇÃO SAPATOS / CALÇAS — somente Loja de Roupas ---
+        shoe_sizes_list = []
+        pants_sizes_list = []
+        if self.business_type in ("loja_roupa",):
+            shoes_pants_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+            shoes_pants_card.pack(fill="x", pady=(0, 15))
+
+            # Container horizontal com separador
+            sp_container = ctk.CTkFrame(shoes_pants_card, fg_color="transparent")
+            sp_container.pack(fill="x", padx=10, pady=10)
+            sp_container.columnconfigure(0, weight=1)
+            sp_container.columnconfigure(2, weight=1)
+
+            # === SAPATOS (esquerda) ===
+            shoe_frame = ctk.CTkFrame(sp_container, fg_color="transparent")
+            shoe_frame.grid(row=0, column=0, sticky="nsew", padx=5)
+
+            ctk.CTkLabel(shoe_frame, text="Sapatos / Tênis", font=("Aileron", 13, "bold"), text_color="#7BBDE8").pack(pady=(0, 5))
+
+            shoe_list_frame = ctk.CTkFrame(shoe_frame, fg_color="transparent")
+            shoe_list_frame.pack(fill="x")
+
+            def _add_shoe_row(tam_default=26, qtd_default=0):
+                row_frame = ctk.CTkFrame(shoe_list_frame, fg_color="transparent")
+                row_frame.pack(fill="x", pady=2)
+                ctk.CTkLabel(row_frame, text="Nº", font=("Aileron", 10)).pack(side="left", padx=(0, 2))
+                e_tam = ctk.CTkEntry(row_frame, width=55, justify="center")
+                e_tam.insert(0, str(tam_default))
+                e_tam.pack(side="left", padx=2)
+                ctk.CTkLabel(row_frame, text="Qtd", font=("Aileron", 10)).pack(side="left", padx=(5, 2))
+                e_qtd = ctk.CTkEntry(row_frame, width=55, justify="center")
+                e_qtd.insert(0, str(qtd_default))
+                e_qtd.pack(side="left", padx=2)
+                btn_rm = ctk.CTkButton(row_frame, text="✕", width=28, height=28, fg_color="#FF6B6B",
+                                       hover_color="#FF5252", text_color="white",
+                                       command=lambda: (_remove_shoe_row(row_frame, entry_data)))
+                btn_rm.pack(side="left", padx=5)
+                entry_data = {'frame': row_frame, 'tam': e_tam, 'qtd': e_qtd}
+                shoe_sizes_list.append(entry_data)
+
+            def _remove_shoe_row(frame, data):
+                frame.destroy()
+                if data in shoe_sizes_list:
+                    shoe_sizes_list.remove(data)
+
+            _add_shoe_row(26, 0)
+
+            ctk.CTkButton(shoe_frame, text="+ Tamanho", height=30, fg_color="#28a745", hover_color="#218838",
+                          text_color="white", font=("Aileron", 11, "bold"),
+                          command=lambda: _add_shoe_row(26, 0)).pack(pady=(5, 0))
+
+            # === Separador vertical azul ===
+            separator = ctk.CTkFrame(sp_container, width=3, fg_color="#7BBDE8")
+            separator.grid(row=0, column=1, sticky="ns", padx=8)
+
+            # === CALÇAS (direita) ===
+            pants_frame = ctk.CTkFrame(sp_container, fg_color="transparent")
+            pants_frame.grid(row=0, column=2, sticky="nsew", padx=5)
+
+            ctk.CTkLabel(pants_frame, text="Calças", font=("Aileron", 13, "bold"), text_color="#7BBDE8").pack(pady=(0, 5))
+
+            pants_list_frame = ctk.CTkFrame(pants_frame, fg_color="transparent")
+            pants_list_frame.pack(fill="x")
+
+            def _add_pants_row(tam_default=34, qtd_default=0):
+                row_frame = ctk.CTkFrame(pants_list_frame, fg_color="transparent")
+                row_frame.pack(fill="x", pady=2)
+                ctk.CTkLabel(row_frame, text="Nº", font=("Aileron", 10)).pack(side="left", padx=(0, 2))
+                e_tam = ctk.CTkEntry(row_frame, width=55, justify="center")
+                e_tam.insert(0, str(tam_default))
+                e_tam.pack(side="left", padx=2)
+                ctk.CTkLabel(row_frame, text="Qtd", font=("Aileron", 10)).pack(side="left", padx=(5, 2))
+                e_qtd = ctk.CTkEntry(row_frame, width=55, justify="center")
+                e_qtd.insert(0, str(qtd_default))
+                e_qtd.pack(side="left", padx=2)
+                btn_rm = ctk.CTkButton(row_frame, text="✕", width=28, height=28, fg_color="#FF6B6B",
+                                       hover_color="#FF5252", text_color="white",
+                                       command=lambda: (_remove_pants_row(row_frame, entry_data)))
+                btn_rm.pack(side="left", padx=5)
+                entry_data = {'frame': row_frame, 'tam': e_tam, 'qtd': e_qtd}
+                pants_sizes_list.append(entry_data)
+
+            def _remove_pants_row(frame, data):
+                frame.destroy()
+                if data in pants_sizes_list:
+                    pants_sizes_list.remove(data)
+
+            _add_pants_row(34, 0)
+
+            ctk.CTkButton(pants_frame, text="+ Tamanho", height=30, fg_color="#28a745", hover_color="#218838",
+                          text_color="white", font=("Aileron", 11, "bold"),
+                          command=lambda: _add_pants_row(34, 0)).pack(pady=(5, 0))
+
+        # --- PRECIFICAÇÃO INTELIGENTE (IA) ---
+        ctk.CTkLabel(pricing_card, text="Precificação Inteligente (IA)", font=("Aileron", 14, "bold"), text_color="#7BBDE8").pack(pady=10, padx=15, anchor="w")
+        ctk.CTkLabel(pricing_card, text="Preencha para calcular o preço de venda sugerido pela IA:", font=("Aileron", 10, "italic"), text_color="gray").pack(padx=15, anchor="w")
+        
+        grid_price = ctk.CTkFrame(pricing_card, fg_color="transparent")
+        grid_price.pack(fill="x", padx=10, pady=5)
+        grid_price.columnconfigure(0, weight=1)
+        grid_price.columnconfigure(1, weight=1)
+        grid_price.columnconfigure(2, weight=1)
+        grid_price.columnconfigure(3, weight=1)
+
+        fields_config = [
+            ("Horas Trabalho", "horas", "0", 0, 0),
+            ("Valor Hora (R$)", "v_hora", "0.00", 0, 1),
+            ("Margem Lucro (%)", "margem", "20", 0, 2),
+            ("Risco (%)", "risco", "10", 0, 3),
+        ]
+        
+        adv_entries = {}
+        for label, key, default, r, c in fields_config:
+            ctk.CTkLabel(grid_price, text=label, font=("Aileron", 10, "bold")).grid(row=r, column=c, sticky="w", padx=5, pady=(5,0))
+            e = ctk.CTkEntry(grid_price)
+            e.insert(0, default)
+            e.grid(row=r+1, column=c, sticky="ew", padx=5, pady=(0, 10))
+            adv_entries[key] = e
+
+        def calcular_sugestao():
+            try:
+                custo = float(e_preco_compra.get().replace(",", "."))
+                horas = float(adv_entries["horas"].get().replace(",", "."))
+                v_hora = float(adv_entries["v_hora"].get().replace(",", "."))
+                margem = float(adv_entries["margem"].get().replace(",", ".")) / 100.0
+                risco = float(adv_entries["risco"].get().replace(",", ".")) / 100.0
+                raridade = 1.0
+                
+                engine = ai_module.PricingEngine()
+                res = engine.calcular_preco_etico(custo, horas, v_hora, margem, risco, raridade)
+                
+                e_preco.delete(0, "end")
+                e_preco.insert(0, f"{res['preco_sugerido']:.2f}")
+                _calcular_margem_live()
+                
+                messagebox.showinfo("Cálculo Detalhado", 
+                                f"Preço Sugerido: R$ {res['preco_sugerido']:.2f}\n\n"
+                                f"Custo Base: R$ {res['custo_base']:.2f}\n"
+                                f"Fórmula: {res['detalhes']}", parent=dialog)
+            except ValueError:
+                messagebox.showerror("Erro", "Preencha o Preço de Compra e os valores corretamente.", parent=dialog)
+
+        ctk.CTkButton(pricing_card, text="CALCULAR RECOMENDAÇÃO (IA)", command=calcular_sugestao, 
+                    fg_color="#0A4174", hover_color="#062F56", height=35).pack(fill="x", padx=15, pady=(5, 15))
+
+        # --- Save ---
+        def save():
+            try:
+                nome = entries["Nome"].get().strip()
+                if not nome:
+                    messagebox.showerror("Erro", "Nome é obrigatório", parent=dialog)
+                    return
+                
+                qtd = int(entries["Quantidade"].get())
+                preco_txt = entries["Preço Venda"].get().replace(",", ".")
+                preco = float(preco_txt) if preco_txt else 0.0
+                cat = entries["Categoria"].get()
+                barcode = entries["Codigo"].get().strip()
+                lote_serie = entries["Lote"].get().strip()
+                
+                # Extra data - Preço de Compra (campo principal)
+                preco_compra_txt = entries["PrecoCompra"].get().replace(",", ".")
+                custo = float(preco_compra_txt) if preco_compra_txt.strip() else 0.0
+                horas = float(adv_entries["horas"].get().replace(",", "."))
+                v_hora = float(adv_entries["v_hora"].get().replace(",", "."))
+                margem = float(adv_entries["margem"].get().replace(",", ".")) / 100.0
+                risco = float(adv_entries["risco"].get().replace(",", ".")) / 100.0
+                raridade = 1.0
+                
+                # Image
+                img_name = None
+                if self.temp_image_path:
+                    img_dir = os.path.join(self.db.data_dir, "product_images")
+                    if not os.path.exists(img_dir): os.makedirs(img_dir)
+                    ext = os.path.splitext(self.temp_image_path)[1]
+                    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                    safe_name = "".join([c for c in nome if c.isalnum()]).strip()
+                    img_name = f"prod_{safe_name}_{ts}{ext}"
+                    try:
+                        shutil.copy2(self.temp_image_path, os.path.join(img_dir, img_name))
+                    except Exception as e: logger.warning("Erro ao copiar imagem do produto: %s", e)
+
+                self.db.adicionar_produto(
+                    nome, qtd, preco, cat, 
+                    preco_compra=custo, imagem=img_name,
+                    horas_trabalho=horas, valor_hora=v_hora,
+                    margem_lucro=margem, fator_risco=risco, fator_raridade=raridade,
+                    codigo_barras=barcode
+                )
+                
+                # Salvar estoque mínimo configurado
+                estoque_min_val = entries["EstoqueMinimo"].get().strip()
+                subcat_val = entries["Subcategoria"].get().strip()
+                tamanho_val = entries["Tamanho"].get().strip()
+                sub_subcat_val = entries["SubSubcategoria"].get().strip()
+
+                # Buscar id do produto recém inserido
+                cursor = self.db.conn.cursor()
+                cursor.execute("SELECT id FROM produtos WHERE nome = ? ORDER BY id DESC LIMIT 1", (nome,))
+                row = cursor.fetchone()
+                if row:
+                    prod_id = row[0]
+                    if estoque_min_val:
+                        try:
+                            min_val = int(estoque_min_val)
+                            self.db.set_estoque_minimo(prod_id, min_val)
+                        except (ValueError, Exception):
+                            pass
+                    # Salvar subcategoria e tamanho
+                    if subcat_val and subcat_val != "(nenhuma)":
+                        cursor.execute("UPDATE produtos SET subcategoria = ? WHERE id = ?", (subcat_val, prod_id))
+                    if tamanho_val and tamanho_val != "(nenhum)":
+                        cursor.execute("UPDATE produtos SET tamanho = ? WHERE id = ?", (tamanho_val, prod_id))
+                    if sub_subcat_val and sub_subcat_val != "(nenhuma)":
+                        cursor.execute("UPDATE produtos SET sub_subcategoria = ? WHERE id = ?", (sub_subcat_val, prod_id))
+                    if lote_serie:
+                        cursor.execute("UPDATE produtos SET lote_serie = ? WHERE id = ?", (lote_serie, prod_id))
+                    
+                    # Salvar estoque por tamanho (P/M/G/GG)
+                    if size_entries:
+                        try:
+                            ep = int(size_entries["P"].get() or 0)
+                            em = int(size_entries["M"].get() or 0)
+                            eg = int(size_entries["G"].get() or 0)
+                            egg = int(size_entries["GG"].get() or 0)
+                            if ep > 0 or em > 0 or eg > 0 or egg > 0:
+                                self.db.atualizar_estoque_tamanhos(prod_id, ep, em, eg, egg)
+                        except (ValueError, Exception):
+                            pass
+
+                    # Salvar unidade de medida e preço por peso (Padaria/Açougue)
+                    if e_unidade is not None:
+                        un = e_unidade.get()
+                        cursor.execute("UPDATE produtos SET unidade_medida = ? WHERE id = ?", (un, prod_id))
+                    if e_preco_peso is not None:
+                        try:
+                            pp = float(e_preco_peso.get().replace(",", ".") or 0)
+                            cursor.execute("UPDATE produtos SET preco_por_peso = ? WHERE id = ?", (pp, prod_id))
+                        except (ValueError, Exception):
+                            pass
+
+                    # Salvar tipo de produto (produto/insumo) e sob encomenda
+                    if e_tipo_produto is not None:
+                        tp = e_tipo_produto.get()
+                        cursor.execute("UPDATE produtos SET tipo_produto = ? WHERE id = ?", (tp, prod_id))
+                    if e_sob_encomenda is not None:
+                        se = 1 if e_sob_encomenda.get() == "Sim" else 0
+                        cursor.execute("UPDATE produtos SET sob_encomenda = ? WHERE id = ?", (se, prod_id))
+                    
+                    self.db.conn.commit()
+                
+                # Salvar variações de Sapatos (tamanhos numéricos)
+                for sd in shoe_sizes_list:
+                    try:
+                        tam = sd['tam'].get().strip()
+                        qtd_s = int(sd['qtd'].get() or 0)
+                        if tam and qtd_s > 0:
+                            nome_var = f"{nome} - Nº {tam}"
+                            self.db.adicionar_produto(
+                                nome_var, qtd_s, preco, cat,
+                                preco_compra=custo, imagem=img_name,
+                                horas_trabalho=horas, valor_hora=v_hora,
+                                margem_lucro=margem, fator_risco=risco, fator_raridade=raridade,
+                                codigo_barras=barcode
+                            )
+                    except (ValueError, Exception):
+                        pass
+
+                # Salvar variações de Calças (tamanhos numéricos)
+                for pd_item in pants_sizes_list:
+                    try:
+                        tam = pd_item['tam'].get().strip()
+                        qtd_c = int(pd_item['qtd'].get() or 0)
+                        if tam and qtd_c > 0:
+                            nome_var = f"{nome} - Tam {tam}"
+                            self.db.adicionar_produto(
+                                nome_var, qtd_c, preco, cat,
+                                preco_compra=custo, imagem=img_name,
+                                horas_trabalho=horas, valor_hora=v_hora,
+                                margem_lucro=margem, fator_risco=risco, fator_raridade=raridade,
+                                codigo_barras=barcode
+                            )
+                    except (ValueError, Exception):
+                        pass
+
+                messagebox.showinfo("Sucesso", "Produto cadastrado com sucesso!", parent=dialog)
+                self.refresh_dashboard()
+                dialog.destroy()
+                
+            except ValueError:
+                messagebox.showerror("Erro", "Verifique os campos numéricos.", parent=dialog)
+
+        ctk.CTkButton(main_frame, text="CONFIRMAR CADASTRO", command=save, height=50, 
+                    fg_color="#28a745", hover_color="#218838", font=("Aileron", 14, "bold")).pack(pady=20, fill="x")
+
+    def open_kit_manager(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Gerenciador de Kits")
+        window.geometry("950x700")
+        window.attributes("-topmost", True)
+
+        # State
+        self.temp_kit_items = []
+
+        # Layout
+        main_layout = ctk.CTkFrame(window, fg_color="transparent")
+        main_layout.pack(fill="both", expand=True, padx=20, pady=20)
+
+        left_col = ctk.CTkFrame(main_layout, width=400, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        left_col.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        
+        right_col = ctk.CTkFrame(main_layout, width=400, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        right_col.pack(side="right", fill="both", expand=True, padx=(10, 0))
+
+        # --- LEFT: PRODUTOS ---
+        ctk.CTkLabel(left_col, text="1. Selecionar Produtos", font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=15)
+        
+        e_search = ctk.CTkEntry(left_col, placeholder_text="Buscar produto...", height=35)
+        e_search.pack(fill="x", padx=15, pady=(0, 15))
+        
+        prod_list = ctk.CTkScrollableFrame(left_col, fg_color="transparent")
+        prod_list.pack(fill="both", expand=True, padx=5, pady=5)
+
+        try:
+            df_prods = self.db.listar_produtos()
+        except Exception: df_prods = pd.DataFrame(columns=['id', 'nome', 'preco'])
+        
+        def add_item_to_kit_action(nome): 
+             # Simples input dialog para QTD
+            dialog_qtd = ctk.CTkInputDialog(text=f"Quantidade de '{nome}' no kit:", title="Composição")
+             # Hack para tornar modal/topmost
+             # (CTkInputDialog é difícil de customizar o parent, mas geralmente funciona)
+            try:
+                val_str = dialog_qtd.get_input()
+                if val_str:
+                    val = int(val_str)
+                    if val > 0:
+                        self.temp_kit_items.append({'nome': nome, 'quantidade': val})
+                        refresh_kit_ui()
+            except Exception: pass
+
+        def load_prods(query=""):
+            for w in prod_list.winfo_children(): w.destroy()
+            if df_prods.empty: return
+            
+            for _, row in df_prods.iterrows():
+                if query.lower() in str(row['nome']).lower():
+                    f = ctk.CTkFrame(prod_list, fg_color=("white", "#404040"), corner_radius=8, border_width=1, border_color=("#EEEEEE", "#555555"))
+                    f.pack(fill="x", pady=3, padx=5)
+                    
+                    lbl = ctk.CTkLabel(f, text=f"{row['nome']}", anchor="w", font=("Aileron", 12))
+                    lbl.pack(side="left", padx=10, fill="x", expand=True)
+                    
+                    ctk.CTkButton(f, text="+", width=30, height=25, fg_color="#0A4174", 
+                                command=lambda n=row['nome']: add_item_to_kit_action(n)).pack(side="right", padx=5, pady=5)
+
+        e_search.bind("<KeyRelease>", lambda e: load_prods(e_search.get()))
+        load_prods()
+
+        # --- RIGHT: KIT DEFINITION ---
+        ctk.CTkLabel(right_col, text="2. Configurar Kit (Virtual)", font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=15)
+        
+        ctk.CTkLabel(right_col, text="Nome do Kit:", font=("Aileron", 12, "bold")).pack(anchor="w", padx=15)
+        e_nome = ctk.CTkEntry(right_col, height=35)
+        e_nome.pack(fill="x", padx=15, pady=(5, 15))
+        
+        ctk.CTkLabel(right_col, text="Preço Venda (Fixo/Promo):", font=("Aileron", 12, "bold")).pack(anchor="w", padx=15)
+        e_preco = ctk.CTkEntry(right_col, height=35)
+        e_preco.pack(fill="x", padx=15, pady=(5, 15))
+        
+        ctk.CTkLabel(right_col, text="Composição:", font=("Aileron", 12, "bold")).pack(anchor="w", padx=15)
+        kit_list_frame = ctk.CTkScrollableFrame(right_col, height=250, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        kit_list_frame.pack(fill="both", expand=True, padx=15, pady=5)
+
+        lbl_soma = ctk.CTkLabel(right_col, text="Soma Produtos: R$ 0.00", text_color="gray")
+        lbl_soma.pack(pady=5)
+
+        def refresh_kit_ui():
+            for w in kit_list_frame.winfo_children(): w.destroy()
+            soma_individual = 0
+            
+            for i, item in enumerate(self.temp_kit_items):
+                f = ctk.CTkFrame(kit_list_frame, fg_color=("white", "#404040"), corner_radius=6)
+                f.pack(fill="x", pady=2, padx=5)
+                
+                txt = f"{item['quantidade']}un - {item['nome']}"
+                ctk.CTkLabel(f, text=txt, anchor="w").pack(side="left", padx=10, pady=5)
+                
+                ctk.CTkButton(f, text="X", width=30, height=20, fg_color="#FF6B6B", text_color="white",
+                            command=lambda idx=i: remove_kit_item(idx)).pack(side="right", padx=5)
+                
+                # Soma Custo
+                if not df_prods.empty:
+                    p = df_prods[df_prods['nome'] == item['nome']]
+                    if not p.empty:
+                        soma_individual += p.iloc[0]['preco'] * item['quantidade']
+            
+            lbl_soma.configure(text=f"Soma Produtos: R$ {soma_individual:.2f}")
+
+        def remove_kit_item(idx):
+            del self.temp_kit_items[idx]
+            refresh_kit_ui()
+        
+        def save_kit():
+            nome = e_nome.get().strip()
+            try:
+                preco = float(e_preco.get().replace(",", "."))
+            except (ValueError, AttributeError):
+                messagebox.showerror("Erro", "Preço inválido", parent=window)
+                return
+            
+            if not nome:
+                messagebox.showerror("Erro", "Defina um nome para o kit.", parent=window)
+                return
+            if not self.temp_kit_items:
+                messagebox.showerror("Erro", "O kit precisa ter pelo menos um produto.", parent=window)
+                return
+                
+            self.db.adicionar_kit(nome, 0, preco, 0, self.temp_kit_items)
+            messagebox.showinfo("Sucesso", "Kit criado com sucesso!\nEle aparecerá no PDV.", parent=window)
+            window.destroy()
+
+        ctk.CTkButton(right_col, text="SALVAR KIT", height=45, fg_color="#28a745", hover_color="#218838", font=("Aileron", 14, "bold"), command=save_kit).pack(pady=20, padx=15, fill="x")
+
+    def _fechar_pdv(self, dialog):
+        """Fecha janela do PDV e limpa referência singleton."""
+        self._pdv_dialog = None
+        dialog.destroy()
+
+    def open_sell_product_dialog(self):
+        # Singleton: impedir múltiplas janelas de PDV
+        if self._pdv_dialog is not None and self._pdv_dialog.winfo_exists():
+            self._pdv_dialog.focus()
+            return
+
+        # Verificar se o caixa está aberto antes de vender
+        if not self.db.caixa_aberto():
+            messagebox.showwarning(
+                "Caixa Fechado",
+                "Abra o caixa antes de registrar vendas.\n\nAcesse: Menu lateral → CAIXA"
+            )
+            return
+
+        # Janela de PDV (Ponto de Venda)
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("PDV - Registrar Venda")
+        dialog.geometry("900x600")
+        dialog.minsize(700, 400)
+        dialog.attributes("-topmost", True)
+        self._pdv_dialog = dialog
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._fechar_pdv(dialog))
+        
+        # Variáveis de Estado
+        self.carrinho = []
+        
+        # -- Layout --
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        left_container = ctk.CTkFrame(main_frame, fg_color="transparent")
+        left_container.pack(side="left", fill="both", expand=True, padx=(0, 5))
+
+        left_frame = ctk.CTkScrollableFrame(left_container, fg_color=("white", "#2B2B2B"), corner_radius=15,
+                                             scrollbar_button_color=("#CCCCCC", "#555555"))
+        left_frame.pack(fill="both", expand=True)
+        
+        right_container = ctk.CTkFrame(main_frame, fg_color="transparent")
+        right_container.pack(side="right", fill="both", expand=True, padx=(5, 0))
+
+        right_frame = ctk.CTkScrollableFrame(right_container, fg_color=("white", "#2B2B2B"), corner_radius=15,
+                                              scrollbar_button_color=("#CCCCCC", "#555555"))
+        right_frame.pack(fill="both", expand=True)
+        
+        # --- ESQUERDA: Seleção de Produto ---
+        ctk.CTkLabel(left_frame, text="Adicionar Produto / Kit", font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=15)
+        
+        # Leitor de Código de Barras
+        lbl_scan = ctk.CTkLabel(left_frame, text="Scan Código de Barras:", font=("Aileron", 11, "italic"))
+        lbl_scan.pack(fill="x", padx=15, pady=(0,0))
+        scan_row = ctk.CTkFrame(left_frame, fg_color="transparent")
+        scan_row.pack(fill="x", padx=15, pady=(0, 5))
+        entry_scan = ctk.CTkEntry(scan_row, placeholder_text="Clique aqui e escaneie...")
+        entry_scan.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        # Botão de câmera para scanner por webcam
+        def _abrir_camera_scanner():
+            if not BARCODE_SCANNER_AVAILABLE:
+                messagebox.showinfo("Indisponível", "Instale opencv-python e pyzbar para usar o scanner por câmera.", parent=dialog)
+                return
+            # Aqui barcode_scanner já foi importado com sucesso
+            if not barcode_scanner.scanner_disponivel():
+                messagebox.showinfo("Indisponível", "Câmera não disponível ou drivers não instalados.", parent=dialog)
+                return
+
+            cam_win = ctk.CTkToplevel(dialog)
+            cam_win.title("Scanner por Câmera")
+            cam_win.geometry("640x520")
+            cam_win.attributes("-topmost", True)
+            cam_win.resizable(False, False)
+
+            lbl_video = ctk.CTkLabel(cam_win, text="Iniciando câmera...", width=640, height=480)
+            lbl_video.pack()
+
+            lbl_status = ctk.CTkLabel(cam_win, text="Aponte o código de barras para a câmera",
+                                      font=("Aileron", 12), text_color=("#333", "white"))
+            lbl_status.pack(pady=5)
+
+            import cv2 as _cv2
+            cap = _cv2.VideoCapture(0)
+            _cam_running = [True]
+
+            def _update_frame():
+                if not _cam_running[0]:
+                    return
+                try:
+                    if not cam_win.winfo_exists():
+                        return
+                except Exception:
+                    return
+                ret, frame = cap.read()
+                if ret:
+                    from pyzbar import pyzbar as _pyzbar
+                    barcodes = _pyzbar.decode(frame)
+                    for bc in barcodes:
+                        pts = bc.polygon
+                        if len(pts) == 4:
+                            for i in range(4):
+                                _cv2.line(frame, (pts[i].x, pts[i].y),
+                                         (pts[(i+1) % 4].x, pts[(i+1) % 4].y), (0, 255, 0), 3)
+                        code_data = bc.data.decode('utf-8', errors='ignore')
+                        if code_data:
+                            _cam_running[0] = False
+                            cap.release()
+                            cam_win.destroy()
+                            entry_scan.delete(0, 'end')
+                            entry_scan.insert(0, code_data)
+                            entry_scan.event_generate('<Return>')
+                            return
+
+                    frame_rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(frame_rgb)
+                    ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(640, 480))
+                    lbl_video.configure(image=ctk_img, text="")
+                    lbl_video._cam_img_ref = ctk_img
+
+                if _cam_running[0]:
+                    cam_win.after(33, _update_frame)
+
+            def _on_cam_close():
+                _cam_running[0] = False
+                cap.release()
+                try:
+                    cam_win.destroy()
+                except Exception:
+                    pass
+
+            cam_win.protocol("WM_DELETE_WINDOW", _on_cam_close)
+            cam_win.after(100, _update_frame)
+
+        btn_cam = ctk.CTkButton(scan_row, text="📷", width=40, height=32,
+                                fg_color="#0A4174", hover_color="#062F56",
+                                command=_abrir_camera_scanner)
+        btn_cam.pack(side="right")
+        
+        # Carregar Produtos e Kits (excluir insumos do PDV)
+        df_prods = self.db.listar_produtos_vendaveis()
+        if not df_prods.empty:
+            df_prods['type'] = 'produto'
+            df_prods['display_name'] = df_prods.apply(lambda r: f"{r['nome']} (Estoque: {r['quantidade']} | R$ {r['preco']:.2f})", axis=1)
+
+        df_kits = self.db.listar_kits()
+        if not df_kits.empty:
+            df_kits['type'] = 'kit'
+            df_kits['display_name'] = df_kits.apply(lambda r: f"[KIT] {r['nome']} (Promo: R$ {r['preco_venda']:.2f})", axis=1)
+        
+        # Mapa unificado (Nome Display -> Linha de dados)
+        item_map = {}
+        all_items_list = []  # lista ordenada de dicts
+        if not df_prods.empty:
+            for _, r in df_prods.iterrows():
+                item_map[r['display_name']] = r
+                all_items_list.append(dict(r))
+        if not df_kits.empty:
+            for _, r in df_kits.iterrows():
+                item_map[r['display_name']] = r
+                all_items_list.append(dict(r))
+
+        # Ordenar: mais vendidos no topo, depois alfabético
+        top_vendidos = self.db.obter_produtos_mais_vendidos(50)
+        top_vendidos_set = set(top_vendidos)
+        top_vendidos_rank = {pid: idx for idx, pid in enumerate(top_vendidos)}
+
+        def _sort_key(item):
+            item_id = item.get('id')
+            if item.get('type') == 'produto' and item_id in top_vendidos_set:
+                return (0, top_vendidos_rank[item_id])
+            return (1, item.get('display_name', ''))
+
+        all_items_list.sort(key=_sort_key)
+
+        if not all_items_list:
+            ctk.CTkLabel(left_frame, text="Sem itens cadastrados.", text_color="red").pack(pady=20)
+            return
+
+        # --- Busca + Filtros por Categoria / Subcategoria / Sub-subcategoria ---
+        search_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        search_frame.pack(fill="x", padx=15, pady=(5, 0))
+
+        entry_busca = ctk.CTkEntry(search_frame, placeholder_text="🔍 Buscar produto...", height=32)
+        entry_busca.pack(fill="x")
+
+        filter_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        filter_frame.pack(fill="x", padx=15, pady=(3, 0))
+
+        # Coletar categorias únicas dos produtos
+        cats_unicas = ["Todas"]
+        if not df_prods.empty and 'categoria' in df_prods.columns:
+            cats_unicas += sorted(df_prods['categoria'].dropna().unique().tolist())
+        var_filtro_cat = ctk.StringVar(value="Todas")
+        combo_filtro_cat = ctk.CTkComboBox(filter_frame, values=cats_unicas, variable=var_filtro_cat, width=120, state="readonly", height=28, font=("Aileron", 10))
+        combo_filtro_cat.pack(side="left", padx=(0, 3))
+
+        var_filtro_subcat = ctk.StringVar(value="Todas")
+        combo_filtro_subcat = ctk.CTkComboBox(filter_frame, values=["Todas"], variable=var_filtro_subcat, width=120, state="readonly", height=28, font=("Aileron", 10))
+        combo_filtro_subcat.pack(side="left", padx=(0, 3))
+
+        var_filtro_subsub = ctk.StringVar(value="Todas")
+        combo_filtro_subsub = ctk.CTkComboBox(filter_frame, values=["Todas"], variable=var_filtro_subsub, width=120, state="readonly", height=28, font=("Aileron", 10))
+        combo_filtro_subsub.pack(side="left")
+
+        def _on_cat_change(*_):
+            cat_sel = var_filtro_cat.get()
+            if cat_sel == "Todas":
+                combo_filtro_subcat.configure(values=["Todas"])
+                var_filtro_subcat.set("Todas")
+                combo_filtro_subsub.configure(values=["Todas"])
+                var_filtro_subsub.set("Todas")
+            else:
+                subcats = ["Todas"]
+                if not df_prods.empty and 'subcategoria' in df_prods.columns:
+                    mask = df_prods['categoria'] == cat_sel
+                    subcats += sorted(df_prods.loc[mask, 'subcategoria'].dropna().loc[lambda s: s != ''].unique().tolist())
+                combo_filtro_subcat.configure(values=subcats)
+                var_filtro_subcat.set("Todas")
+                combo_filtro_subsub.configure(values=["Todas"])
+                var_filtro_subsub.set("Todas")
+
+        def _on_subcat_change(*_):
+            cat_sel = var_filtro_cat.get()
+            subcat_sel = var_filtro_subcat.get()
+            if subcat_sel == "Todas" or cat_sel == "Todas":
+                combo_filtro_subsub.configure(values=["Todas"])
+                var_filtro_subsub.set("Todas")
+            else:
+                subsubs = ["Todas"]
+                if not df_prods.empty and 'sub_subcategoria' in df_prods.columns:
+                    mask = (df_prods['categoria'] == cat_sel) & (df_prods['subcategoria'] == subcat_sel)
+                    subsubs += sorted(df_prods.loc[mask, 'sub_subcategoria'].dropna().loc[lambda s: s != ''].unique().tolist())
+                combo_filtro_subsub.configure(values=subsubs)
+                var_filtro_subsub.set("Todas")
+
+        var_filtro_cat.trace_add("write", _on_cat_change)
+        var_filtro_subcat.trace_add("write", _on_subcat_change)
+
+        # --- Lista scrollable de produtos (substitui o ComboBox) ---
+        prod_scroll = ctk.CTkScrollableFrame(left_frame, fg_color=("#F5F5F5", "#333333"), corner_radius=10, height=180)
+        prod_scroll.pack(fill="both", expand=True, padx=15, pady=5)
+
+        # Cache de imagens
+        _img_cache_pdv = {}
+
+        def _carregar_imagem_produto(item_row):
+            """Retorna CTkImage (60x60) ou None."""
+            if item_row.get('type') != 'produto':
+                return None
+            img_name = item_row.get('imagem', '')
+            if not img_name:
+                return None
+            if img_name in _img_cache_pdv:
+                return _img_cache_pdv[img_name]
+            try:
+                img_path = os.path.join(self.db.data_dir, "product_images", img_name)
+                if os.path.exists(img_path):
+                    pil_img = Image.open(img_path)
+                    pil_img.thumbnail((100, 100), Image.Resampling.LANCZOS)
+                    ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(100, 100))
+                    _img_cache_pdv[img_name] = ctk_img
+                    return ctk_img
+            except Exception as e:
+                logger.debug("Erro ao carregar preview: %s", e)
+            return None
+
+        # Tooltip flutuante com foto ao passar o mouse na lista de seleção
+        _hover_tooltip = None
+        _hover_tooltip_img_ref = None
+        _hover_current_item = [None]  # item_data do produto atualmente em hover
+        _hover_after_id = [None]      # ID do after pendente (debounce)
+        _HOVER_DELAY_MS = 200         # atraso antes de mostrar o tooltip
+
+        def _do_show_tooltip(item_data, x_root, y_root):
+            """Cria efetivamente o tooltip após o debounce."""
+            nonlocal _hover_tooltip, _hover_tooltip_img_ref
+            # Se mudou de item enquanto esperava, cancela
+            if _hover_current_item[0] is not item_data:
+                return
+            # Se já existe um tooltip para o mesmo item, ignora
+            if _hover_tooltip:
+                try:
+                    if _hover_tooltip.winfo_exists():
+                        return
+                except Exception:
+                    _hover_tooltip = None
+
+            ctk_img = _carregar_imagem_produto(item_data)
+            if not ctk_img:
+                return  # Sem imagem, sem tooltip
+
+            _hover_tooltip = tw = ctk.CTkToplevel(dialog)
+            tw.wm_overrideredirect(True)
+            tw.attributes("-topmost", True)
+            tw.wm_geometry(f"+{x_root + 15}+{y_root + 10}")
+
+            frame_tt = ctk.CTkFrame(tw, fg_color=("white", "#2B2B2B"), corner_radius=10,
+                                    border_width=1, border_color=("#CCCCCC", "#555555"))
+            frame_tt.pack(fill="both", expand=True, padx=2, pady=2)
+
+            _hover_tooltip_img_ref = ctk_img
+            ctk.CTkLabel(frame_tt, image=ctk_img, text="").pack(padx=8, pady=(8, 4))
+            ctk.CTkLabel(frame_tt, text=item_data.get('nome', ''), font=("Aileron", 11, "bold"),
+                        text_color=("#001D39", "white"), wraplength=160).pack(padx=8, pady=(0, 8))
+
+        def _show_hover_preview(event, item_data):
+            nonlocal _hover_tooltip
+            # Se já está em hover no mesmo item, apenas reposiciona o tooltip existente
+            if _hover_current_item[0] is item_data:
+                if _hover_tooltip:
+                    try:
+                        if _hover_tooltip.winfo_exists():
+                            _hover_tooltip.wm_geometry(f"+{event.x_root + 15}+{event.y_root + 10}")
+                    except Exception:
+                        pass
+                return
+            # Mudou de item — destruir tooltip anterior e cancelar debounce pendente
+            _destroy_tooltip()
+            _hover_current_item[0] = item_data
+            # Agendar criação do tooltip com debounce
+            if _hover_after_id[0]:
+                try:
+                    dialog.after_cancel(_hover_after_id[0])
+                except Exception:
+                    pass
+            _hover_after_id[0] = dialog.after(
+                _HOVER_DELAY_MS,
+                lambda: _do_show_tooltip(item_data, event.x_root, event.y_root)
+            )
+
+        def _destroy_tooltip():
+            """Remove tooltip sem limpar o item atual."""
+            nonlocal _hover_tooltip, _hover_tooltip_img_ref
+            if _hover_after_id[0]:
+                try:
+                    dialog.after_cancel(_hover_after_id[0])
+                except Exception:
+                    pass
+                _hover_after_id[0] = None
+            if _hover_tooltip:
+                try:
+                    _hover_tooltip.destroy()
+                except Exception:
+                    pass
+                _hover_tooltip = None
+                _hover_tooltip_img_ref = None
+
+        def _is_mouse_inside_frame(frame):
+            """Verifica se o ponteiro do mouse ainda está dentro do frame."""
+            try:
+                mx, my = frame.winfo_pointerxy()
+                fx = frame.winfo_rootx()
+                fy = frame.winfo_rooty()
+                fw = frame.winfo_width()
+                fh = frame.winfo_height()
+                return fx <= mx < fx + fw and fy <= my < fy + fh
+            except Exception:
+                return False
+
+        def _on_frame_leave(event, frame):
+            """Só esconde o tooltip se o mouse realmente saiu da área do frame."""
+            # Quando o mouse passa do frame para seu filho (btn), tkinter
+            # dispara <Leave> no frame — mas o mouse ainda está dentro.
+            if _is_mouse_inside_frame(frame):
+                return  # Falso Leave — mouse ainda está no frame
+            _destroy_tooltip()
+            _hover_current_item[0] = None
+
+        def _hide_hover_preview(event=None):
+            _destroy_tooltip()
+            _hover_current_item[0] = None
+
+        # Variável para armazenar item selecionado
+        _selected_item = [None]  # lista mutável para closure
+
+        def _select_item(item_data):
+            _selected_item[0] = item_data
+            # Destacar visualmente (atualizar lista)
+            _populate_product_list()
+
+        def _quick_add_to_cart(item_data):
+            """Duplo-clique adiciona 1 unidade direto ao carrinho."""
+            try:
+                add_to_cart_logic(item_data, 1)
+            except Exception:
+                pass
+
+        def _populate_product_list():
+            for w in prod_scroll.winfo_children():
+                w.destroy()
+
+            query = entry_busca.get().strip().lower()
+            cat_filter = var_filtro_cat.get()
+            subcat_filter = var_filtro_subcat.get()
+            subsub_filter = var_filtro_subsub.get()
+
+            for item_data in all_items_list:
+                # Filtro de busca por texto E código de barras
+                if query:
+                    nome_match = query in item_data.get('display_name', '').lower()
+                    codigo_match = query == item_data.get('codigo_barras', '').lower() if item_data.get('codigo_barras') else False
+                    if not nome_match and not codigo_match:
+                        continue
+                # Filtro por categoria
+                if cat_filter != "Todas":
+                    item_cat = item_data.get('categoria', '')
+                    if item_data.get('type') == 'kit':
+                        pass  # kits sempre visíveis
+                    elif str(item_cat) != cat_filter:
+                        continue
+                # Filtro por subcategoria
+                if subcat_filter != "Todas":
+                    item_subcat = item_data.get('subcategoria', '') or ''
+                    if item_data.get('type') != 'kit' and str(item_subcat) != subcat_filter:
+                        continue
+                # Filtro por sub-subcategoria
+                if subsub_filter != "Todas":
+                    item_subsub = item_data.get('sub_subcategoria', '') or ''
+                    if item_data.get('type') != 'kit' and str(item_subsub) != subsub_filter:
+                        continue
+
+                is_selected = (_selected_item[0] is not None and 
+                              item_data.get('display_name') == _selected_item[0].get('display_name'))
+
+                fg = ("#D6EAF8", "#1A3A5C") if is_selected else ("white", "#404040")
+                border_color = ("#0A4174", "#7BBDE8") if is_selected else ("#7BBDE8", "#49769F")
+                border_w = 2
+
+                f = ctk.CTkFrame(prod_scroll, fg_color=fg, corner_radius=8, 
+                                border_width=border_w, border_color=border_color)
+                f.pack(fill="x", pady=2, padx=3)
+
+                nome_display = item_data.get('nome', '')
+                tipo = item_data.get('type', 'produto')
+                if tipo == 'kit':
+                    txt = f"[KIT] {nome_display}  —  R$ {item_data.get('preco_venda', 0):.2f}"
+                else:
+                    cat_txt = item_data.get('categoria', '')
+                    sub_txt = item_data.get('subcategoria', '') or ''
+                    tam_txt = item_data.get('tamanho', '') or ''
+                    sub_sub_txt = item_data.get('sub_subcategoria', '') or ''
+                    extras = []
+                    if cat_txt: extras.append(cat_txt)
+                    if sub_txt: extras.append(sub_txt)
+                    if sub_sub_txt: extras.append(sub_sub_txt)
+                    if tam_txt: extras.append(tam_txt)
+                    info_extra = " | ".join(extras)
+                    # Mostrar estoque por tamanho se disponível
+                    ep = item_data.get('estoque_p', 0) or 0
+                    em = item_data.get('estoque_m', 0) or 0
+                    eg = item_data.get('estoque_g', 0) or 0
+                    egg = item_data.get('estoque_gg', 0) or 0
+                    txt = f"{nome_display}  —  Est: {item_data.get('quantidade', 0)} | R$ {item_data.get('preco', 0):.2f}"
+                    # Mostrar preço por peso para padaria/açougue
+                    unidade_m = item_data.get('unidade_medida', 'un') or 'un'
+                    preco_peso_v = item_data.get('preco_por_peso', 0) or 0
+                    if unidade_m in ('kg', 'g') and preco_peso_v > 0:
+                        txt = f"{nome_display}  —  R$ {preco_peso_v:.2f}/kg"
+                    if ep > 0 or em > 0 or eg > 0 or egg > 0:
+                        txt += f"\nP:{ep} M:{em} G:{eg} GG:{egg}"
+                    if info_extra:
+                        txt += f"\n{info_extra}"
+
+                btn = ctk.CTkButton(f, text=txt, text_color=("#333333", "white"), 
+                                   fg_color="transparent", hover_color=("#E8F4FD", "#2A4A6A"),
+                                   anchor="w", font=("Aileron", 11),
+                                   command=lambda d=item_data: _select_item(d))
+                btn.pack(fill="x", padx=5, pady=4)
+
+                # Duplo-clique adiciona direto ao carrinho
+                btn.bind("<Double-1>", lambda e, d=item_data: _quick_add_to_cart(d))
+                f.bind("<Double-1>", lambda e, d=item_data: _quick_add_to_cart(d))
+
+                # Hover para mostrar foto — bind em frame E botão para continuidade
+                f.bind("<Enter>", lambda e, d=item_data: _show_hover_preview(e, d))
+                btn.bind("<Enter>", lambda e, d=item_data: _show_hover_preview(e, d))
+                f.bind("<Leave>", lambda e, fr=f: _on_frame_leave(e, fr))
+                btn.bind("<Leave>", lambda e, fr=f: _on_frame_leave(e, fr))
+
+        # Garantir que sair da área do scroll limpa o tooltip
+        prod_scroll.bind("<Leave>", _hide_hover_preview)
+        entry_busca.bind("<KeyRelease>", lambda e: _populate_product_list())
+        var_filtro_cat.trace_add("write", lambda *a: _populate_product_list())
+        var_filtro_subcat.trace_add("write", lambda *a: _populate_product_list())
+        var_filtro_subsub.trace_add("write", lambda *a: _populate_product_list())
+        _populate_product_list()
+
+        # Quantidade e Cliente com setas
+        ctk.CTkLabel(left_frame, text="Quantidade:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
+        
+        qtd_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        qtd_frame.pack(fill="x", padx=15, pady=3)
+        
+        def _diminuir_qtd():
+            try:
+                val = int(entry_qtd.get())
+                if val > 1:
+                    entry_qtd.delete(0, "end")
+                    entry_qtd.insert(0, str(val - 1))
+            except ValueError:
+                entry_qtd.delete(0, "end")
+                entry_qtd.insert(0, "1")
+
+        def _aumentar_qtd():
+            try:
+                val = int(entry_qtd.get())
+                entry_qtd.delete(0, "end")
+                entry_qtd.insert(0, str(val + 1))
+            except ValueError:
+                entry_qtd.delete(0, "end")
+                entry_qtd.insert(0, "1")
+
+        ctk.CTkButton(qtd_frame, text="▼", width=40, height=35, fg_color="#7BBDE8", hover_color="#49769F",
+                      text_color="#001D39", font=("Aileron", 16, "bold"), command=_diminuir_qtd).pack(side="left", padx=(0, 5))
+        entry_qtd = ctk.CTkEntry(qtd_frame, width=80, justify="center")
+        entry_qtd.insert(0, "1")
+        entry_qtd.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(qtd_frame, text="▲", width=40, height=35, fg_color="#7BBDE8", hover_color="#49769F",
+                      text_color="#001D39", font=("Aileron", 16, "bold"), command=_aumentar_qtd).pack(side="left", padx=(5, 0))
+
+        # Campo de peso (apenas para Padaria/Açougue)
+        entry_peso = None
+        if self.business_type == "padaria_acougue":
+            ctk.CTkLabel(left_frame, text="Peso (kg):", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
+            peso_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+            peso_frame.pack(fill="x", padx=15, pady=3)
+            entry_peso = ctk.CTkEntry(peso_frame, placeholder_text="Ex: 0.500", justify="center")
+            entry_peso.pack(side="left", fill="x", expand=True, padx=(0, 5))
+            ctk.CTkLabel(peso_frame, text="kg", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(side="left")
+
+        # Desconto por item
+        ctk.CTkLabel(left_frame, text="Desconto por Item:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
+        desc_item_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        desc_item_frame.pack(fill="x", padx=15, pady=3)
+        entry_desc_item = ctk.CTkEntry(desc_item_frame, placeholder_text="0", width=80)
+        entry_desc_item.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        tipo_desc_item_var = ctk.StringVar(value="%")
+        ctk.CTkComboBox(desc_item_frame, values=["%", "R$"], variable=tipo_desc_item_var, width=60, state="readonly").pack(side="left")
+
+        # Seleção de Cliente
+        ctk.CTkLabel(left_frame, text="Cliente:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
+        df_clientes = self.db.listar_clientes()
+        clientes_options = ["Consumidor Final"] + (df_clientes['nome'].tolist() if not df_clientes.empty else [])
+        var_cliente = ctk.StringVar(value="Consumidor Final")
+        combo_cliente = ctk.CTkComboBox(left_frame, values=clientes_options, variable=var_cliente)
+        combo_cliente.pack(fill="x", padx=15, pady=3)
+
+        # Contato / WhatsApp do Cliente
+        ctk.CTkLabel(left_frame, text="Contato / WhatsApp:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
+        entry_contato_cliente = ctk.CTkEntry(left_frame, placeholder_text="(11) 99999-9999")
+        entry_contato_cliente.pack(fill="x", padx=15, pady=3)
+
+        def _on_cliente_change(*args):
+            """Preenche o contato automaticamente ao selecionar um cliente cadastrado."""
+            nome_sel = var_cliente.get()
+            entry_contato_cliente.delete(0, "end")
+            if nome_sel != "Consumidor Final" and not df_clientes.empty:
+                c_rows = df_clientes[df_clientes['nome'] == nome_sel]
+                if not c_rows.empty:
+                    contato = c_rows.iloc[0].get('contato', '')
+                    if contato:
+                        entry_contato_cliente.insert(0, contato)
+
+        var_cliente.trace_add("write", _on_cliente_change)
+
+        # Seleção de Vendedor (auto-detecta turno)
+        ctk.CTkLabel(left_frame, text="Vendedor:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
+        df_vendedores = self.db.listar_vendedores()
+        vendedores_options = [""] + (df_vendedores['nome'].tolist() if not df_vendedores.empty else [])
+        vendedor_turno = self.db.vendedor_no_turno()
+        var_vendedor = ctk.StringVar(value=vendedor_turno)
+        combo_vendedor = ctk.CTkComboBox(left_frame, values=vendedores_options, variable=var_vendedor)
+        combo_vendedor.pack(fill="x", padx=15, pady=3)
+
+        def add_to_cart_logic(item_row, qtd, peso_kg=None):
+            if qtd <= 0: raise ValueError
+            
+            # Check Availability Logic
+            if item_row['type'] == 'produto':
+                if qtd > item_row['quantidade']:
+                    messagebox.showerror("Erro", f"Estoque insuficiente! Disponível: {item_row['quantidade']}", parent=dialog)
+                    return
+                price = item_row['preco']
+                name = item_row['nome']
+                item_id = item_row['id']
+
+                # Venda por peso (Padaria/Açougue)
+                unidade = item_row.get('unidade_medida', 'un') or 'un'
+                if peso_kg and peso_kg > 0 and unidade in ('kg', 'g'):
+                    preco_peso = item_row.get('preco_por_peso', 0) or 0
+                    if preco_peso > 0:
+                        price = preco_peso * peso_kg
+                    name = f"{name} ({peso_kg:.3f}kg)"
+                
+            elif item_row['type'] == 'kit':
+                # Check dynamic kit availability
+                max_kits = self.db.verificar_disponibilidade_kit(item_row['id'])
+                if qtd > max_kits:
+                    messagebox.showerror("Erro", f"Estoque insuficiente para montar {qtd} kits!\nMáximo possível hoje: {max_kits}", parent=dialog)
+                    return
+                price = item_row['preco_venda']
+                name = f"[KIT] {item_row['nome']}"
+                item_id = item_row['id']
+            
+            # Calcular desconto por item
+            desc_val_item = 0.0
+            try:
+                desc_input = entry_desc_item.get().strip()
+                if desc_input:
+                    desc_val_item = float(desc_input.replace(",", "."))
+            except ValueError:
+                desc_val_item = 0.0
+
+            if desc_val_item > 0:
+                if tipo_desc_item_var.get() == "%":
+                    price = price * (1 - desc_val_item / 100)
+                else:
+                    price = max(0, price - desc_val_item)
+            
+            # Verificar se já tem no carrinho
+            for c_item in self.carrinho:
+                if c_item['id'] == item_id and c_item['type'] == item_row['type']:
+                    # Re-check total limit
+                    if item_row['type'] == 'produto':
+                        if c_item['qtd'] + qtd > item_row['quantidade']:
+                            messagebox.showerror("Erro", "Limite de estoque atingido.", parent=dialog)
+                            return
+                    elif item_row['type'] == 'kit':
+                        max_kits_check = self.db.verificar_disponibilidade_kit(item_row['id'])
+                        if c_item['qtd'] + qtd > max_kits_check:
+                            messagebox.showerror("Erro", "Limite de kits atingido.", parent=dialog)
+                            return
+                    
+                    c_item['qtd'] += qtd
+                    update_cart_ui()
+                    return
+            
+            # Adicionar novo
+            preco_original = item_row.get('preco', price) if item_row['type'] == 'produto' else item_row.get('preco_venda', price)
+            desconto_aplicado = preco_original - price if price < preco_original else 0.0
+            self.carrinho.append({
+                'id': item_id,
+                'type': item_row['type'],
+                'nome': name,
+                'preco': price,
+                'preco_original': preco_original,
+                'desconto_item': desconto_aplicado,
+                'qtd': qtd,
+                'row_data': item_row # Guarda dados originais para referencia
+            })
+            update_cart_ui()
+
+        def add_to_cart():
+            try:
+                item_row = _selected_item[0]
+                if item_row is None:
+                    messagebox.showerror("Erro", "Selecione um produto na lista.", parent=dialog)
+                    return
+                qtd = int(entry_qtd.get())
+                peso_kg = None
+                if entry_peso is not None:
+                    peso_str = entry_peso.get().strip().replace(",", ".")
+                    if peso_str:
+                        peso_kg = float(peso_str)
+                add_to_cart_logic(item_row, qtd, peso_kg=peso_kg)
+            except ValueError:
+                messagebox.showerror("Erro", "Quantidade inválida.", parent=dialog)
+            except Exception as e:
+                messagebox.showerror("Erro", f"Ocorreu um erro: {e}", parent=dialog)
+
+        ctk.CTkButton(left_frame, text="Adicionar ao Carrinho", command=add_to_cart, height=40, fg_color="#0A4174", hover_color="#062F56").pack(padx=15, pady=20, fill="x")
+        
+        def on_scan(event=None):
+            code = entry_scan.get().strip()
+            if not code: return
+            
+            # Buscar produto pelo codigo
+            res_df = self.db.buscar_produto_por_codigo(code)
+            
+            if not res_df.empty:
+                # Produto encontrado!
+                p_row = res_df.iloc[0]
+                p_row['type'] = 'produto'
+                _mostrar_popup_desconto_scan(p_row)
+                entry_scan.delete(0, 'end')
+            else:
+                messagebox.showwarning("Não encontrado", f"Produto com código '{code}' não encontrado.", parent=dialog)
+                entry_scan.select_range(0, 'end')
+
+        def _mostrar_popup_desconto_scan(p_row):
+            """Popup de desconto antes de adicionar produto escaneado ao carrinho."""
+            preco = p_row['preco']
+            nome = p_row['nome']
+
+            popup = ctk.CTkToplevel(dialog)
+            popup.title("Produto Escaneado")
+            popup.geometry("380x340")
+            popup.attributes("-topmost", True)
+            popup.resizable(False, False)
+            popup.grab_set()
+
+            ctk.CTkLabel(popup, text=f"📦 {nome}", font=("Aileron", 15, "bold"),
+                         wraplength=340).pack(pady=(15, 3))
+            ctk.CTkLabel(popup, text=f"Preço: R$ {preco:.2f}", font=("Aileron", 13)).pack(pady=(0, 10))
+
+            # Quantidade
+            qtd_frame = ctk.CTkFrame(popup, fg_color="transparent")
+            qtd_frame.pack(fill="x", padx=25, pady=(0, 5))
+            ctk.CTkLabel(qtd_frame, text="Quantidade:", anchor="w").pack(side="left")
+            entry_qtd_scan = ctk.CTkEntry(qtd_frame, width=60)
+            entry_qtd_scan.pack(side="right")
+            entry_qtd_scan.insert(0, "1")
+
+            # Checkbox desconto
+            var_desc = ctk.BooleanVar(value=False)
+            desc_check = ctk.CTkCheckBox(popup, text="Aplicar desconto?", variable=var_desc)
+            desc_check.pack(pady=(5, 5))
+
+            # Frame de desconto (inicialmente oculto)
+            desc_frame = ctk.CTkFrame(popup, fg_color="transparent")
+
+            ctk.CTkLabel(desc_frame, text="Tipo:", anchor="w").pack(fill="x", padx=5)
+            var_tipo = ctk.StringVar(value="%")
+            ctk.CTkComboBox(desc_frame, values=["%", "R$"], variable=var_tipo,
+                            width=80, state="readonly").pack(padx=5, pady=(0, 5))
+
+            ctk.CTkLabel(desc_frame, text="Valor do desconto:", anchor="w").pack(fill="x", padx=5)
+            entry_desc_val = ctk.CTkEntry(desc_frame, placeholder_text="0", width=100)
+            entry_desc_val.pack(padx=5, pady=(0, 5))
+
+            def _toggle_desc():
+                if var_desc.get():
+                    desc_frame.pack(fill="x", padx=25, pady=(0, 5))
+                else:
+                    desc_frame.pack_forget()
+            var_desc.trace_add("write", lambda *_a: _toggle_desc())
+
+            def _confirmar():
+                try:
+                    qtd = int(entry_qtd_scan.get())
+                    if qtd <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("Erro", "Quantidade inválida.", parent=popup)
+                    return
+
+                preco_final = preco
+                if var_desc.get():
+                    try:
+                        desc_v = float(entry_desc_val.get().strip().replace(",", "."))
+                    except (ValueError, AttributeError):
+                        desc_v = 0.0
+                    if desc_v > 0:
+                        if var_tipo.get() == "%":
+                            preco_final = preco * (1 - desc_v / 100)
+                        else:
+                            preco_final = max(0, preco - desc_v)
+
+                # Temporariamente setar os campos de desconto do formulário para a lógica do carrinho
+                # Usar add_to_cart_logic sem desconto (já calculamos aqui)
+                old_desc = entry_desc_item.get()
+                entry_desc_item.delete(0, 'end')
+                entry_desc_item.insert(0, "0")
+
+                # Criar row modificado com preco ajustado
+                import copy
+                p_mod = copy.copy(p_row)
+                p_mod['preco'] = preco_final
+
+                try:
+                    add_to_cart_logic(p_mod, qtd)
+                except Exception as e:
+                    messagebox.showerror("Erro ao adicionar", str(e), parent=popup)
+                finally:
+                    entry_desc_item.delete(0, 'end')
+                    if old_desc:
+                        entry_desc_item.insert(0, old_desc)
+                    popup.destroy()
+
+            ctk.CTkButton(popup, text="✅ Adicionar ao Carrinho", command=_confirmar,
+                          height=38, fg_color="#0A4174", hover_color="#062F56").pack(pady=(10, 10), padx=25, fill="x")
+
+        entry_scan.bind('<Return>', on_scan)
+        entry_scan.focus_set()
+        
+        # --- DIREITA: Carrinho e Finalização ---
+        ctk.CTkLabel(right_frame, text="Carrinho de Compras", font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=(10, 5))
+        
+        # Lista 
+        tree_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True, padx=10)
+
+        # Estilo do Treeview para tema claro/escuro
+        style_cart = ttk.Style()
+        is_dark_mode = ctk.get_appearance_mode() == "Dark"
+        if is_dark_mode:
+            style_cart.configure("Cart.Treeview", background="#2B2B2B", foreground="white",
+                                fieldbackground="#2B2B2B", rowheight=28)
+            style_cart.configure("Cart.Treeview.Heading", background="#3A3A3A", foreground="white")
+        else:
+            style_cart.configure("Cart.Treeview", background="white", foreground="#333333",
+                                fieldbackground="white", rowheight=28)
+            style_cart.configure("Cart.Treeview.Heading", background="#E8F4FD", foreground="#001D39")
+
+        columns = ("qtd", "produto", "unit", "total")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=10, style="Cart.Treeview")
+        tree.heading("qtd", text="Qtd")
+        tree.heading("produto", text="Produto")
+        tree.heading("unit", text="Unit (R$)")
+        tree.heading("total", text="Total (R$)")
+        
+        tree.column("qtd", width=50, anchor="center")
+        tree.column("produto", width=150)
+        tree.column("unit", width=80, anchor="e")
+        tree.column("total", width=80, anchor="e")
+        
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        lbl_total = ctk.CTkLabel(right_frame, text="Total: R$ 0,00", font=("Aileron", 18, "bold"), text_color="#28a745")
+        lbl_total.pack(pady=(5, 3))
+
+        # --- Seção de Desconto ---
+        desc_frame = ctk.CTkFrame(right_frame, fg_color=("white", "#3A3A3A"), corner_radius=10)
+        desc_frame.pack(fill="x", padx=10, pady=3)
+
+        ctk.CTkLabel(desc_frame, text="Desconto:", font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).pack(side="left", padx=(10, 5), pady=8)
+        entry_desconto = ctk.CTkEntry(desc_frame, width=80, placeholder_text="0")
+        entry_desconto.pack(side="left", padx=2, pady=8)
+
+        tipo_desconto_var = ctk.StringVar(value="%")
+        combo_tipo_desc = ctk.CTkComboBox(desc_frame, values=["%", "R$"], variable=tipo_desconto_var, width=60, state="readonly")
+        combo_tipo_desc.pack(side="left", padx=5, pady=8)
+
+        lbl_total_final = ctk.CTkLabel(right_frame, text="", font=("Aileron", 13, "bold"), text_color="#0A4174")
+        lbl_total_final.pack(pady=(0, 3))
+
+        # --- Seção de Forma de Pagamento (Múltiplas) ---
+        pgto_container = ctk.CTkFrame(right_frame, fg_color=("white", "#3A3A3A"), corner_radius=10)
+        pgto_container.pack(fill="x", padx=10, pady=3)
+
+        pgto_header = ctk.CTkFrame(pgto_container, fg_color="transparent")
+        pgto_header.pack(fill="x", padx=10, pady=(5, 0))
+        ctk.CTkLabel(pgto_header, text="Pagamento:", font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).pack(side="left")
+
+        pagamentos_list = []  # [{forma, valor_entry, frame}]
+        pgto_rows_frame = ctk.CTkFrame(pgto_container, fg_color="transparent")
+        pgto_rows_frame.pack(fill="x", padx=5, pady=3)
+
+        formas_pgto_options = ["Dinheiro", "PIX", "Cartão Débito", "Cartão Crédito", "Fiado"]
+
+        def _add_pgto_row(forma="Dinheiro", valor=""):
+            row_f = ctk.CTkFrame(pgto_rows_frame, fg_color="transparent")
+            row_f.pack(fill="x", pady=2)
+            var_forma = ctk.StringVar(value=forma)
+            combo = ctk.CTkComboBox(row_f, values=formas_pgto_options, variable=var_forma, width=130, state="readonly")
+            combo.pack(side="left", padx=2)
+            entry_val = ctk.CTkEntry(row_f, width=90, placeholder_text="R$ 0,00")
+            if valor:
+                entry_val.insert(0, valor)
+            entry_val.pack(side="left", padx=2)
+            entry_val.bind("<KeyRelease>", lambda e: _update_troco())
+            item = {"forma_var": var_forma, "valor_entry": entry_val, "frame": row_f}
+            
+            def _remove():
+                if len(pagamentos_list) <= 1:
+                    return
+                pagamentos_list.remove(item)
+                row_f.destroy()
+                _update_troco()
+
+            btn_rem = ctk.CTkButton(row_f, text="✕", width=28, height=28, fg_color="#FF6B6B",
+                                    hover_color="#FF5252", text_color="white", command=_remove)
+            btn_rem.pack(side="left", padx=2)
+            pagamentos_list.append(item)
+            var_forma.trace_add("write", lambda *a: _update_troco())
+
+        _add_pgto_row()
+
+        def _add_pgto_click():
+            _add_pgto_row()
+
+        ctk.CTkButton(pgto_container, text="+ Forma de Pagamento", height=26, fg_color="#7BBDE8",
+                      hover_color="#49769F", text_color="#001D39", font=("Aileron", 10, "bold"),
+                      command=_add_pgto_click).pack(padx=10, pady=(2, 5))
+
+        # --- Seção de Troco (aparece só quando tem Dinheiro) ---
+        troco_frame = ctk.CTkFrame(right_frame, fg_color=("white", "#3A3A3A"), corner_radius=10)
+        troco_frame.pack(fill="x", padx=10, pady=3)
+
+        ctk.CTkLabel(troco_frame, text="Valor recebido:", font=("Aileron", 11), text_color=("#001D39", "white")).pack(side="left", padx=(10, 5), pady=8)
+        entry_troco = ctk.CTkEntry(troco_frame, width=100, placeholder_text="0,00")
+        entry_troco.pack(side="left", padx=2, pady=8)
+        lbl_troco = ctk.CTkLabel(troco_frame, text="", font=("Aileron", 12, "bold"), text_color="#28a745")
+        lbl_troco.pack(side="left", padx=10, pady=8)
+
+        # --- Observação da Venda ---
+        obs_frame = ctk.CTkFrame(right_frame, fg_color=("white", "#3A3A3A"), corner_radius=10)
+        obs_frame.pack(fill="x", padx=10, pady=3)
+        ctk.CTkLabel(obs_frame, text="Observação:", font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).pack(side="left", padx=(10, 5), pady=8)
+        entry_obs_venda = ctk.CTkEntry(obs_frame, placeholder_text="Ex: entregar às 14h, embalar para presente...")
+        entry_obs_venda.pack(side="left", fill="x", expand=True, padx=(2, 10), pady=8)
+
+        def _calcular_troco(*args):
+            try:
+                recebido = float(entry_troco.get().replace(",", "."))
+                _, total_final = calcular_desconto()
+                troco = recebido - total_final
+                if troco >= 0:
+                    lbl_troco.configure(text=f"Troco: R$ {troco:.2f}", text_color="#28a745")
+                else:
+                    lbl_troco.configure(text=f"Falta: R$ {abs(troco):.2f}", text_color="#FF6B6B")
+            except ValueError:
+                lbl_troco.configure(text="")
+
+        entry_troco.bind("<KeyRelease>", _calcular_troco)
+
+        def _has_dinheiro():
+            return any(p["forma_var"].get() == "Dinheiro" for p in pagamentos_list)
+
+        def _update_troco(*args):
+            if _has_dinheiro():
+                troco_frame.pack(fill="x", padx=10, pady=3)
+            else:
+                troco_frame.pack_forget()
+
+        _update_troco()
+
+        def calcular_desconto():
+            """Retorna (valor_desconto, total_com_desconto)"""
+            total_bruto = sum(item['qtd'] * item['preco'] for item in self.carrinho)
+            try:
+                desc_val = float(entry_desconto.get().replace(",", ".")) if entry_desconto.get().strip() else 0.0
+            except ValueError:
+                desc_val = 0.0
+            if tipo_desconto_var.get() == "%":
+                valor_desconto = total_bruto * (desc_val / 100)
+            else:
+                valor_desconto = desc_val
+            valor_desconto = min(valor_desconto, total_bruto)  # Não ultrapassa o total
+            return valor_desconto, total_bruto - valor_desconto
+
+        def atualizar_label_desconto(*args):
+            if not self.carrinho:
+                lbl_total_final.configure(text="")
+                return
+            valor_desc, total_final = calcular_desconto()
+            if valor_desc > 0:
+                lbl_total_final.configure(text=f"Desconto: -R$ {valor_desc:.2f}  |  Total Final: R$ {total_final:.2f}")
+            else:
+                lbl_total_final.configure(text="")
+
+        entry_desconto.bind("<KeyRelease>", atualizar_label_desconto)
+        tipo_desconto_var.trace_add("write", atualizar_label_desconto)
+        
+        def update_cart_ui():
+            # Limpar
+            for item in tree.get_children():
+                tree.delete(item)
+            
+            total = 0.0
+            for item in self.carrinho:
+                subtotal = item['qtd'] * item['preco']
+                total += subtotal
+                tree.insert("", "end", values=(item['qtd'], item['nome'], f"{item['preco']:.2f}", f"{subtotal:.2f}"))
+            
+            lbl_total.configure(text=f"Subtotal: R$ {total:.2f}")
+            atualizar_label_desconto()
+
+        def remover_item():
+            selected = tree.selection()
+            if not selected: return
+            
+            idx = tree.index(selected[0])
+            del self.carrinho[idx]
+            update_cart_ui()
+
+        def alterar_preco_item():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("Alerta", "Selecione um item no carrinho.", parent=dialog)
+                return
+            idx = tree.index(selected[0])
+            item = self.carrinho[idx]
+
+            preco_dialog = ctk.CTkToplevel(dialog)
+            preco_dialog.title("Alterar Preço")
+            preco_dialog.geometry("350x200")
+            preco_dialog.attributes("-topmost", True)
+            preco_dialog.grab_set()
+            preco_dialog.focus_set()
+
+            ctk.CTkLabel(preco_dialog, text=f"Produto: {item['nome']}", font=("Aileron", 13, "bold")).pack(pady=(15, 5))
+            ctk.CTkLabel(preco_dialog, text=f"Preço atual: R$ {item['preco']:.2f}", font=("Aileron", 11)).pack(pady=(0, 10))
+
+            ctk.CTkLabel(preco_dialog, text="Novo preço (R$):", font=("Aileron", 11)).pack(padx=20, anchor="w")
+            entry_novo_preco = ctk.CTkEntry(preco_dialog, height=35, placeholder_text="0.00")
+            entry_novo_preco.pack(padx=20, fill="x", pady=(2, 10))
+            entry_novo_preco.insert(0, f"{item['preco']:.2f}")
+            entry_novo_preco.select_range(0, "end")
+            entry_novo_preco.focus_set()
+
+            def _aplicar_preco(event=None):
+                try:
+                    novo = float(entry_novo_preco.get().strip().replace(",", "."))
+                    if novo < 0:
+                        messagebox.showerror("Erro", "Preço não pode ser negativo.", parent=preco_dialog)
+                        return
+                except ValueError:
+                    messagebox.showerror("Erro", "Valor inválido.", parent=preco_dialog)
+                    return
+                preco_original = item.get('preco_original', item['preco'])
+                item['preco'] = novo
+                item['desconto_item'] = max(0, preco_original - novo)
+                update_cart_ui()
+                preco_dialog.destroy()
+
+            entry_novo_preco.bind("<Return>", _aplicar_preco)
+            ctk.CTkButton(preco_dialog, text="Aplicar", command=_aplicar_preco, height=36,
+                         fg_color="#0A4174", hover_color="#062F56").pack(pady=10, padx=20, fill="x")
+            
+        ctk.CTkButton(right_frame, text="Remover Item Selecionado", command=remover_item, height=28, fg_color="#FF6B6B", hover_color="#FF5252", text_color="white").pack(pady=3, padx=10, fill="x")
+        ctk.CTkButton(right_frame, text="Alterar Preço do Item", command=alterar_preco_item, height=28, fg_color="#FF9800", hover_color="#E68900", text_color="white").pack(pady=3, padx=10, fill="x")
+        
+        def finalizar_venda():
+            if not self.carrinho:
+                messagebox.showerror("Erro", "Carrinho vazio.", parent=dialog)
+                return
+
+            # Coletar formas de pagamento
+            formas_usadas = []
+            total_pgto_informado = 0.0
+            for p in pagamentos_list:
+                forma = p["forma_var"].get()
+                val_str = p["valor_entry"].get().strip().replace(",", ".")
+                try:
+                    val = float(val_str) if val_str else 0.0
+                except ValueError:
+                    val = 0.0
+                if val > 0 or len(pagamentos_list) == 1:
+                    formas_usadas.append({"forma": forma, "valor": val})
+                    total_pgto_informado += val
+
+            # Se só tem 1 forma e valor vazio, usar total
+            valor_desconto, total_com_desconto = calcular_desconto()
+            if len(formas_usadas) == 1 and formas_usadas[0]["valor"] == 0:
+                formas_usadas[0]["valor"] = total_com_desconto
+
+            # Forma de pagamento principal (para compatibilidade)
+            forma_pgto = " + ".join(f"{f['forma']} R${f['valor']:.2f}" for f in formas_usadas) if len(formas_usadas) > 1 else formas_usadas[0]["forma"]
+
+            # Validar fiado: precisa ter cliente selecionado
+            if any(f["forma"] == "Fiado" for f in formas_usadas) and var_cliente.get() == "Consumidor Final":
+                messagebox.showerror("Erro", "Para venda fiado, selecione um cliente cadastrado.", parent=dialog)
+                return
+
+            obs_venda = entry_obs_venda.get().strip()
+            
+            msg_confirm = f"Finalizar venda?\n\nSubtotal: R$ {sum(i['qtd']*i['preco'] for i in self.carrinho):.2f}"
+            if valor_desconto > 0:
+                msg_confirm += f"\nDesconto: -R$ {valor_desconto:.2f}"
+            msg_confirm += f"\nTotal: R$ {total_com_desconto:.2f}"
+            msg_confirm += f"\nPagamento: {forma_pgto}"
+            if obs_venda:
+                msg_confirm += f"\nObs: {obs_venda}"
+            
+            if _has_dinheiro():
+                try:
+                    recebido = float(entry_troco.get().replace(",", "."))
+                    troco = recebido - total_com_desconto
+                    if troco >= 0:
+                        msg_confirm += f"\nRecebido: R$ {recebido:.2f} | Troco: R$ {troco:.2f}"
+                except ValueError:
+                    pass
+            
+            if not messagebox.askyesno("Confirmar", msg_confirm, parent=dialog):
+                return
+            
+            try:
+                total_geral = 0
+                itens_nota = []
+                
+                # Processar Itens
+                for item in self.carrinho:
+                    if item['type'] == 'produto':
+                        # Baixa normal
+                        prod_row = item['row_data']
+                        nova_qtd = prod_row['quantidade'] - item['qtd']
+                        
+                        self.db.atualizar_produto(
+                            prod_row['id'], prod_row['nome'], nova_qtd, prod_row['preco'], prod_row['categoria'],
+                            prod_row.get('horas_trabalho',0), prod_row.get('valor_hora',0),
+                            margem_lucro=prod_row.get('margem_lucro', 0.20),
+                            fator_risco=prod_row.get('fator_risco', 0.10),
+                            fator_raridade=prod_row.get('fator_raridade', 1.0),
+                            imagem=prod_row.get('imagem'), codigo_barras=prod_row.get('codigo_barras')
+                        )
+                    elif item['type'] == 'kit':
+                        # Baixa via Kit (explode componentes) - registrar_entrada=False para evitar duplicação
+                        success, msg = self.db.vender_kit(item['id'], item['qtd'], registrar_entrada=False)
+                        if not success:
+                            messagebox.showerror("Erro Estoque", msg, parent=dialog)
+                            return
+                            
+                    total_geral += item['qtd'] * item['preco']
+                    itens_nota.append({
+                        'nome': item['nome'], 'qtd': item['qtd'], 'preco': item['preco'],
+                        'preco_original': item.get('preco_original', item['preco']),
+                        'desconto_item': item.get('desconto_item', 0.0)
+                    })
+                
+                # Registrar Financeiro (com desconto)
+                desc_venda = f"Venda PDV - {len(itens_nota)} itens"
+                if valor_desconto > 0:
+                    desc_venda += f" (Desc: R${valor_desconto:.2f})"
+                if obs_venda:
+                    desc_venda += f" | Obs: {obs_venda}"
+                self.db.adicionar_entrada(total_com_desconto, desc_venda)
+                
+                # Registrar Vendas Detalhadas na tabela vendas
+                cliente_nome = var_cliente.get() if 'var_cliente' in dir() else "Consumidor Final"
+                itens_venda = []
+                for item in self.carrinho:
+                    item_venda = {
+                        'id': item.get('id'),
+                        'nome': item['nome'],
+                        'qtd': item['qtd'],
+                        'preco': item['preco'],
+                        'preco_compra': item.get('row_data', {}).get('preco_compra', 0) if item['type'] == 'produto' else 0
+                    }
+                    itens_venda.append(item_venda)
+                self.db.registrar_venda_detalhada(itens_venda, total_com_desconto, valor_desconto, cliente_nome, forma_pgto, vendedor=var_vendedor.get())
+                
+                # Registrar fiado se for o caso
+                if any(f["forma"] == "Fiado" for f in formas_usadas) and cliente_nome != "Consumidor Final":
+                    try:
+                        c_df = df_clientes[df_clientes['nome'] == cliente_nome]
+                        if not c_df.empty:
+                            c_id = int(c_df.iloc[0]['id'])
+                            self.db.registrar_fiado(c_id, total_com_desconto, desc_venda)
+                    except Exception as e:
+                        logger.warning("Erro ao registrar fiado: %s", e)
+                
+                # Gerar Nota
+                try:
+                    cliente_nome = var_cliente.get()
+                    dados_cliente = {"nome": cliente_nome}
+                    contato_cliente = entry_contato_cliente.get().strip()
+                    if cliente_nome != "Consumidor Final":
+                        c_row = df_clientes[df_clientes['nome'] == cliente_nome].iloc[0]
+                        dados_cliente['contato'] = c_row.get('contato', contato_cliente) or contato_cliente
+                    if contato_cliente:
+                        dados_cliente['contato'] = contato_cliente
+
+                    # Carregar configuração personalizada da nota
+                    config_nota = self.db.get_config_nota()
+
+                    file_path, text_content, wpp_content = invoice_generator.gerar_nota_txt(
+                        itens_nota, dados_cliente, total_com_desconto,
+                        desconto=valor_desconto, abrir_arquivo=False, config_nota=config_nota
+                    )
+                    
+                    # Perguntar se deseja imprimir
+                    if file_path and text_content:
+                        resp = messagebox.askyesno("Imprimir Recibo", 
+                            "Venda finalizada com sucesso!\n\nDeseja imprimir o recibo agora?", parent=dialog)
+                        if resp:
+                            try:
+                                printer = get_printer()
+                                # Resolver caminho do logo para impressão
+                                logo_path = None
+                                logo_file = config_nota.get('empresa_logo', '')
+                                if logo_file:
+                                    logo_path = os.path.join(self.db.data_dir, "product_images", logo_file)
+                                    if not os.path.isfile(logo_path):
+                                        logger.warning("Logo não encontrado em: %s", logo_path)
+                                        logo_path = None
+                                printer.print_text(text_content, logo_path=logo_path)
+                                messagebox.showinfo("Sucesso", "Recibo enviado para impressão!", parent=dialog)
+                            except Exception as e:
+                                logger.warning("Erro ao imprimir: %s", e)
+                                messagebox.showwarning("Aviso", 
+                                    f"Não foi possível imprimir diretamente.\nO recibo foi salvo em:\n{file_path}", parent=dialog)
+                                try:
+                                    if os.name == 'nt':
+                                        os.startfile(file_path)
+                                except Exception:
+                                    pass
+                        
+                        # Oferecer envio por WhatsApp se houver contato
+                        if contato_cliente:
+                            enviar_wpp = messagebox.askyesno("Enviar por WhatsApp",
+                                f"Deseja enviar o recibo por WhatsApp para {contato_cliente}?",
+                                parent=dialog)
+                            if enviar_wpp:
+                                try:
+                                    from printer import enviar_whatsapp
+                                    sucesso = enviar_whatsapp(contato_cliente, wpp_content or text_content)
+                                    if sucesso:
+                                        messagebox.showinfo("WhatsApp", 
+                                            "O WhatsApp Web será aberto com o recibo.\n"
+                                            "Clique em 'Enviar' no navegador para finalizar.", parent=dialog)
+                                    else:
+                                        messagebox.showwarning("WhatsApp", 
+                                            "Não foi possível abrir o WhatsApp.\nVerifique o número do contato.", parent=dialog)
+                                except Exception as e:
+                                    logger.warning("Erro WhatsApp: %s", e)
+                                    messagebox.showwarning("WhatsApp", 
+                                        f"Erro ao enviar por WhatsApp: {e}", parent=dialog)
+                        
+                        if not resp and not contato_cliente:
+                            messagebox.showinfo("Sucesso", f"Venda finalizada!\nRecibo salvo em:\n{file_path}", parent=dialog)
+                    else:
+                        messagebox.showinfo("Sucesso", "Venda finalizada!", parent=dialog)
+                except Exception as e:
+                    logger.warning("Erro ao gerar recibo: %s", e)
+                    messagebox.showinfo("Sucesso", "Venda finalizada! (Erro ao gerar recibo)", parent=dialog)
+                
+                self.refresh_dashboard()
+                dialog.destroy()
+                
+            except Exception as e:
+                messagebox.showerror("Erro Fatal", f"Ocorreu um erro ao processar venda: {e}", parent=dialog)
+
+        ctk.CTkButton(right_frame, text="FINALIZAR VENDA", command=finalizar_venda, height=50, fg_color="#28a745", hover_color="#218838", font=("Aileron", 14, "bold")).pack(pady=(8, 10), padx=10, fill="x")
+
+    # --- Gerenciador de Clientes com Histórico e Fidelidade ---
+    def open_clientes_manager(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Gerenciador de Clientes")
+        window.geometry("900x650")
+        window.attributes("-topmost", True)
+
+        tabview = ctk.CTkTabview(window, width=860, height=580)
+        tabview.pack(padx=15, pady=15, fill="both", expand=True)
+
+        tab_lista = tabview.add("Clientes")
+        tab_historico = tabview.add("Histórico de Compras")
+        tab_fidelidade = tabview.add("Fidelidade")
+
+        # --- TAB 1: Lista de Clientes ---
+        add_frame = ctk.CTkFrame(tab_lista, fg_color=("white", "#2B2B2B"), corner_radius=10)
+        add_frame.pack(fill="x", pady=5, padx=5)
+        ctk.CTkLabel(add_frame, text="Novo Cliente:", font=("Aileron", 12, "bold")).pack(side="left", padx=10, pady=10)
+        e_nome = ctk.CTkEntry(add_frame, placeholder_text="Nome", width=150)
+        e_nome.pack(side="left", padx=5, pady=10)
+        e_contato = ctk.CTkEntry(add_frame, placeholder_text="Contato", width=130)
+        e_contato.pack(side="left", padx=5, pady=10)
+        e_obs = ctk.CTkEntry(add_frame, placeholder_text="Observações", width=150)
+        e_obs.pack(side="left", padx=5, pady=10)
+
+        list_frame = ctk.CTkFrame(tab_lista, fg_color="transparent")
+        list_frame.pack(fill="both", expand=True, pady=5, padx=5)
+
+        c_cols = ("id", "nome", "contato", "obs", "compras")
+        tree_cli = ttk.Treeview(list_frame, columns=c_cols, show="headings", height=12)
+        for c, h, w in [("id", "ID", 40), ("nome", "Nome", 180), ("contato", "Contato", 150), ("obs", "Observações", 200), ("compras", "Compras", 60)]:
+            tree_cli.heading(c, text=h)
+            tree_cli.column(c, width=w)
+        tree_cli.pack(side="left", fill="both", expand=True)
+        ttk.Scrollbar(list_frame, orient="vertical", command=tree_cli.yview).pack(side="right", fill="y")
+
+        def refresh_clientes():
+            for i in tree_cli.get_children(): tree_cli.delete(i)
+            try:
+                df = self.db.listar_clientes()
+                for _, r in df.iterrows():
+                    tree_cli.insert("", "end", values=(r['id'], r['nome'], r.get('contato', ''), r.get('observacoes', ''), r.get('compras_recorrentes', 0)))
+            except Exception as e:
+                logger.warning("Erro listar clientes: %s", e)
+
+        def add_cliente():
+            nome = e_nome.get().strip()
+            if not nome:
+                messagebox.showerror("Erro", "Nome é obrigatório.", parent=window)
+                return
+            self.db.adicionar_cliente(nome, e_contato.get().strip(), e_obs.get().strip())
+            e_nome.delete(0, "end")
+            e_contato.delete(0, "end")
+            e_obs.delete(0, "end")
+            refresh_clientes()
+
+        def remover_cliente():
+            sel = tree_cli.selection()
+            if not sel: return
+            c_id = tree_cli.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirmar", "Remover este cliente?", parent=window):
+                self.db.remover_cliente(c_id)
+                refresh_clientes()
+
+        ctk.CTkButton(add_frame, text="Adicionar", command=add_cliente, width=80, fg_color="#28a745", hover_color="#218838").pack(side="left", padx=5, pady=10)
+        ctk.CTkButton(add_frame, text="Remover", command=remover_cliente, width=80, fg_color="#FF6B6B", hover_color="#FF5252", text_color="white").pack(side="left", padx=5, pady=10)
+
+        refresh_clientes()
+
+        # --- TAB 2: Histórico de Compras por Cliente ---
+        hc_frame = ctk.CTkFrame(tab_historico, fg_color=("white", "#2B2B2B"), corner_radius=10)
+        hc_frame.pack(fill="x", pady=5, padx=5)
+        ctk.CTkLabel(hc_frame, text="Cliente:", font=("Aileron", 11, "bold")).pack(side="left", padx=10, pady=10)
+        df_c = self.db.listar_clientes()
+        c_names = df_c['nome'].tolist() if not df_c.empty else []
+        var_cli = ctk.StringVar(value=c_names[0] if c_names else "")
+        combo_cli = ctk.CTkComboBox(hc_frame, values=c_names, variable=var_cli, width=200)
+        combo_cli.pack(side="left", padx=5, pady=10)
+
+        hc_list_frame = ctk.CTkFrame(tab_historico, fg_color="transparent")
+        hc_list_frame.pack(fill="both", expand=True, pady=5, padx=5)
+
+        hc_cols = ("data", "produto", "qtd", "valor", "lucro", "pgto")
+        tree_hc = ttk.Treeview(hc_list_frame, columns=hc_cols, show="headings", height=12)
+        for c, h, w in [("data", "Data", 130), ("produto", "Produto", 150), ("qtd", "Qtd", 50), ("valor", "Valor", 90), ("lucro", "Lucro", 80), ("pgto", "Pagamento", 100)]:
+            tree_hc.heading(c, text=h)
+            tree_hc.column(c, width=w)
+        tree_hc.pack(side="left", fill="both", expand=True)
+        ttk.Scrollbar(hc_list_frame, orient="vertical", command=tree_hc.yview).pack(side="right", fill="y")
+
+        lbl_total_cli = ctk.CTkLabel(tab_historico, text="", font=("Aileron", 14, "bold"), text_color="#0A4174")
+        lbl_total_cli.pack(pady=5)
+
+        def carregar_historico_cliente():
+            for i in tree_hc.get_children(): tree_hc.delete(i)
+            nome = var_cli.get()
+            if not nome: return
+            try:
+                df_vc = self.db.vendas_por_cliente(nome)
+                total = 0
+                for _, r in df_vc.iterrows():
+                    tree_hc.insert("", "end", values=(
+                        str(r['data_venda'])[:16], r.get('produto_nome', 'N/A'), r['quantidade'],
+                        f"R$ {r['valor_total']:.2f}", f"R$ {r.get('lucro', 0):.2f}", r.get('forma_pagamento', 'N/A')
+                    ))
+                    total += r['valor_total']
+                lbl_total_cli.configure(text=f"Total gasto: R$ {total:.2f} | {len(df_vc)} compras")
+            except Exception as e:
+                logger.warning("Erro hist cliente: %s", e)
+
+        ctk.CTkButton(hc_frame, text="Ver Histórico", command=carregar_historico_cliente, width=100, fg_color="#7BBDE8", text_color="#001D39").pack(side="left", padx=10)
+
+        # --- TAB 3: Programa de Fidelidade ---
+        fid_scroll = ctk.CTkScrollableFrame(tab_fidelidade, fg_color="transparent")
+        fid_scroll.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(fid_scroll, text="Programa de Fidelidade", font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=10, anchor="w")
+        ctk.CTkLabel(fid_scroll, text="A cada R$ 10 em compras = 1 ponto. 100 pontos = R$ 10 de desconto.",
+                    font=("Aileron", 11, "italic"), text_color="gray").pack(anchor="w", padx=10)
+
+        fid_frame = ctk.CTkFrame(fid_scroll, fg_color="transparent")
+        fid_frame.pack(fill="both", expand=True, pady=10)
+
+        def carregar_fidelidade():
+            for w in fid_frame.winfo_children(): w.destroy()
+            try:
+                df_c = self.db.listar_clientes()
+                if df_c.empty:
+                    ctk.CTkLabel(fid_frame, text="Nenhum cliente cadastrado.", text_color="gray").pack(pady=20)
+                    return
+                for _, r in df_c.iterrows():
+                    pontos, total_ac = self.db.get_pontos_cliente(r['id'])
+                    card = ctk.CTkFrame(fid_frame, fg_color=("white", "#2B2B2B"), corner_radius=10)
+                    card.pack(fill="x", pady=3, padx=5)
+                    ctk.CTkLabel(card, text=f"{r['nome']}", font=("Aileron", 13, "bold"), text_color=("#001D39", "white")).pack(side="left", padx=15, pady=10)
+                    ctk.CTkLabel(card, text=f"⭐ {pontos} pts", font=("Aileron", 12, "bold"), text_color="#E67E22").pack(side="left", padx=10)
+                    ctk.CTkLabel(card, text=f"Total acumulado: R$ {total_ac:.2f}", font=("Aileron", 11), text_color="gray").pack(side="left", padx=10)
+                    ctk.CTkLabel(card, text=f"Compras: {r.get('compras_recorrentes', 0)}", font=("Aileron", 11), text_color="gray").pack(side="left", padx=10)
+            except Exception as e:
+                logger.warning("Erro fidelidade: %s", e)
+
+        carregar_fidelidade()
+
+    def open_anota_tudo_dialog(self):
+        """Abre janela moderna do painel Anota Tudo."""
+        window = ctk.CTkToplevel(self)
+        window.title("📝 Anota Tudo — Painel de Anotações")
+        window.geometry("950x700")
+        window.attributes("-topmost", True)
+        
+        # Centralizar na tela
+        window.update_idletasks()
+        w = window.winfo_width()
+        h = window.winfo_height()
+        extra_w = (window.winfo_screenwidth() - w) // 2
+        extra_h = (window.winfo_screenheight() - h) // 2
+        window.geometry(f"{w}x{h}+{extra_w}+{extra_h}")
+        
+        # Grid layout na janela
+        window.grid_columnconfigure(0, weight=4)  # Coluna do formulário (Esquerda)
+        window.grid_columnconfigure(1, weight=6)  # Coluna das notas (Direita)
+        window.grid_rowconfigure(0, weight=1)
+        
+        # Tema e fontes
+        lbl_font_bold = ctk.CTkFont(family="Aileron", size=14, weight="bold")
+        lbl_font_normal = ctk.CTkFont(family="Aileron", size=12)
+        title_font = ctk.CTkFont(family="Aileron", size=18, weight="bold")
+        
+        # Estado de Edição
+        editando_sonho_id = [None]
+        editando_versao = [1]
+        
+        # ID do usuário logado
+        usuario_id = self.current_user["id"] if self.current_user else 1
+
+        # ========================================================
+        # COLUNA ESQUERDA - FORMULÁRIO DE CRIAÇÃO/EDIÇÃO
+        # ========================================================
+        form_frame = ctk.CTkFrame(window, fg_color=("white", "#2B2B2B"), corner_radius=15, border_width=1, border_color=("#E5E5E5", "#3E3E3E"))
+        form_frame.grid(row=0, column=0, padx=(15, 10), pady=15, sticky="nsew")
+        form_frame.grid_columnconfigure(0, weight=1)
+        
+        lbl_form_title = ctk.CTkLabel(form_frame, text="📝 Nova Anotação", font=title_font, text_color=("#0A4174", "white"))
+        lbl_form_title.pack(anchor="w", padx=20, pady=(20, 15))
+        
+        # Campo Título
+        ctk.CTkLabel(form_frame, text="Título:", font=lbl_font_bold).pack(anchor="w", padx=20, pady=(5, 2))
+        entry_titulo = ctk.CTkEntry(form_frame, placeholder_text="Ex: Compras da semana, Tarefas...", height=35)
+        entry_titulo.pack(fill="x", padx=20, pady=(0, 10))
+        
+        # Campo Categoria
+        ctk.CTkLabel(form_frame, text="Categoria/Tag:", font=lbl_font_bold).pack(anchor="w", padx=20, pady=(5, 2))
+        entry_cat = ctk.CTkEntry(form_frame, placeholder_text="Ex: Estoque, Clientes, Financeiro, Ideia", height=35)
+        entry_cat.pack(fill="x", padx=20, pady=(0, 10))
+        
+        # Campo Descrição (Textbox)
+        ctk.CTkLabel(form_frame, text="Conteúdo / Detalhes:", font=lbl_font_bold).pack(anchor="w", padx=20, pady=(5, 2))
+        txt_desc = ctk.CTkTextbox(form_frame, height=180, corner_radius=8, border_width=1, border_color=("#CCCCCC", "#4A4A4A"))
+        txt_desc.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        
+        # Botões de Ação do Form
+        btn_frame = ctk.CTkFrame(form_frame, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=(0, 20))
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+        
+        def resetar_formulario():
+            editando_sonho_id[0] = None
+            editando_versao[0] = 1
+            lbl_form_title.configure(text="📝 Nova Anotação", text_color=("#0A4174", "white"))
+            entry_titulo.delete(0, "end")
+            entry_cat.delete(0, "end")
+            txt_desc.delete("1.0", "end")
+            btn_salvar.configure(text="Adicionar")
+            btn_limpar.configure(text="Limpar")
+            
+        def salvar_anotacao():
+            titulo = entry_titulo.get().strip()
+            categoria = entry_cat.get().strip() or "Geral"
+            descricao = txt_desc.get("1.0", "end-1c").strip()
+            
+            if not titulo or len(titulo) < 3:
+                messagebox.showerror("Erro de Validação", "O título deve ter pelo menos 3 caracteres.", parent=window)
+                return
+            if not descricao or len(descricao) < 10:
+                messagebox.showerror("Erro de Validação", "A descrição deve possuir pelo menos 10 caracteres.", parent=window)
+                return
+                
+            dados = {
+                "usuario_id": usuario_id,
+                "titulo": titulo,
+                "descricao": descricao,
+                "categoria": categoria,
+                "data_registro": datetime.date.today().isoformat()
+            }
+            
+            try:
+                if editando_sonho_id[0] is not None:
+                    # Modo Edição (OCC)
+                    from services.dreams_service import DreamConcurrencyError
+                    try:
+                        self.sonhos_service.editar_sonho(
+                            sonho_id=editando_sonho_id[0],
+                            dados_input=dados,
+                            versao_lida=editando_versao[0],
+                            usuario_requisitor_id=usuario_id
+                        )
+                        messagebox.showinfo("Sucesso", "Anotação atualizada!", parent=window)
+                    except DreamConcurrencyError:
+                        messagebox.showerror(
+                            "Concorrência Detectada", 
+                            "Erro de Concorrência: A anotação foi alterada por outro usuário enquanto você a visualizava.\n"
+                            "Por favor, recarregue e tente novamente.", 
+                            parent=window
+                        )
+                        return
+                    except Exception as e:
+                        messagebox.showerror("Erro de Gravação", f"Falha ao salvar: {e}", parent=window)
+                        return
+                else:
+                    # Modo Criação
+                    self.sonhos_service.adicionar_sonho(dados)
+                    messagebox.showinfo("Sucesso", "Anotação criada!", parent=window)
+                
+                resetar_formulario()
+                carregar_anotacoes()
+            except Exception as ex:
+                messagebox.showerror("Erro", f"Erro: {ex}", parent=window)
+                
+        btn_salvar = ctk.CTkButton(btn_frame, text="Adicionar", fg_color="#28a745", hover_color="#218838", text_color="white", font=lbl_font_bold, height=38, command=salvar_anotacao)
+        btn_salvar.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        
+        btn_limpar = ctk.CTkButton(btn_frame, text="Limpar", fg_color=("#CCCCCC", "#4A4A4A"), hover_color=("#B3B3B3", "#3A3A3A"), text_color=("#333333", "white"), font=lbl_font_bold, height=38, command=resetar_formulario)
+        btn_limpar.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+
+        # ========================================================
+        # COLUNA DIREITA - LISTA DE ANOTAÇÕES
+        # ========================================================
+        list_card = ctk.CTkFrame(window, fg_color="transparent")
+        list_card.grid(row=0, column=1, padx=(10, 15), pady=15, sticky="nsew")
+        list_card.grid_columnconfigure(0, weight=1)
+        list_card.grid_rowconfigure(2, weight=1)
+        
+        # Barra de Pesquisa e Combobox de Categoria
+        search_frame = ctk.CTkFrame(list_card, fg_color=("white", "#2B2B2B"), corner_radius=12, border_width=1, border_color=("#E5E5E5", "#3E3E3E"))
+        search_frame.grid(row=0, column=0, fill="x", pady=(0, 10), sticky="ew")
+        search_frame.grid_columnconfigure(0, weight=7)
+        search_frame.grid_columnconfigure(1, weight=3)
+        
+        entry_busca = ctk.CTkEntry(search_frame, placeholder_text="🔍 Pesquisar por título...", height=35)
+        entry_busca.grid(row=0, column=0, padx=(15, 5), pady=10, sticky="ew")
+        
+        combo_filtro_cat = ctk.CTkComboBox(search_frame, values=["Todas as Categorias"], height=35, state="readonly")
+        combo_filtro_cat.grid(row=0, column=1, padx=(5, 15), pady=10, sticky="ew")
+        combo_filtro_cat.set("Todas as Categorias")
+        
+        # Painel scrollable para os cartões das anotações
+        scroll_notes = ctk.CTkScrollableFrame(list_card, fg_color=("#F5F5F5", "#1E1E1E"), corner_radius=12, border_width=1, border_color=("#E0E0E0", "#333333"))
+        scroll_notes.grid(row=2, column=0, sticky="nsew")
+        
+        # Cache local das anotações listadas para filtragem instantânea
+        anotacoes_cache = []
+
+        def renderizar_anotacoes_filtradas():
+            # Limpar painel
+            for w in scroll_notes.winfo_children():
+                w.destroy()
+                
+            busca = entry_busca.get().strip().lower()
+            cat_filtro = combo_filtro_cat.get()
+            
+            anotacoes_exibidas = []
+            for a in anotacoes_cache:
+                match_busca = (busca in a["titulo"].lower() or busca in a["descricao"].lower())
+                match_cat = (cat_filtro == "Todas as Categorias" or a["categoria"] == cat_filtro)
+                if match_busca and match_cat:
+                    anotacoes_exibidas.append(a)
+                    
+            if not anotacoes_exibidas:
+                ctk.CTkLabel(scroll_notes, text="Nenhuma anotação encontrada.", font=lbl_font_normal, text_color="gray").pack(pady=40)
+                return
+                
+            # Renderizar cartões dinâmicos premium
+            for a in anotacoes_exibidas:
+                card = ctk.CTkFrame(scroll_notes, fg_color=("white", "#2A2A2D"), corner_radius=12, border_width=1, border_color=("#EBEBEB", "#3A3A3D"))
+                card.pack(fill="x", pady=6, padx=10)
+                card.grid_columnconfigure(0, weight=1)
+                
+                # Header do cartão: Título + Tag Categoria
+                header = ctk.CTkFrame(card, fg_color="transparent")
+                header.pack(fill="x", padx=15, pady=(12, 4))
+                
+                lbl_title = ctk.CTkLabel(header, text=a["titulo"], font=ctk.CTkFont(family="Aileron", size=13, weight="bold"), anchor="w", text_color=("#001D39", "white"))
+                lbl_title.pack(side="left", fill="x", expand=True)
+                
+                # Tag / Pill de Categoria com cor harmoniosa e moderna
+                tag_bg = ("#EBF5FB", "#1B2A35")
+                tag_fg = ("#2980B9", "#7BBDE8")
+                
+                if a["categoria"].lower() in ("financeiro", "gasto", "saldo"):
+                    tag_bg = ("#EAF2F8", "#1E3A2F")
+                    tag_fg = ("#27AE60", "#2ECC71")
+                elif a["categoria"].lower() in ("estoque", "produtos", "kits"):
+                    tag_bg = ("#FDF2E9", "#3A281E")
+                    tag_fg = ("#D35400", "#E67E22")
+                elif a["categoria"].lower() in ("clientes", "fidelidade", "vendedores"):
+                    tag_bg = ("#F5EEF8", "#2E1F3A")
+                    tag_fg = ("#8E44AD", "#AF7AC5")
+                    
+                tag_lbl = ctk.CTkLabel(header, text=f"🏷️ {a['categoria']}", font=ctk.CTkFont(family="Aileron", size=9, weight="bold"), fg_color=tag_bg, text_color=tag_fg, corner_radius=8, height=18)
+                tag_lbl.pack(side="right", padx=5)
+                
+                # Metadata do cartão (Data)
+                meta_frame = ctk.CTkFrame(card, fg_color="transparent")
+                meta_frame.pack(fill="x", padx=15, pady=(0, 6))
+                
+                dt_obj = datetime.date.fromisoformat(a["data_registro"])
+                dt_str = dt_obj.strftime("%d/%m/%Y")
+                lbl_date = ctk.CTkLabel(meta_frame, text=f"📅 {dt_str}", font=ctk.CTkFont(family="Aileron", size=10), text_color="gray")
+                lbl_date.pack(side="left")
+                
+                # Conteúdo / Descrição da Anotação
+                desc_label = ctk.CTkLabel(card, text=a["descricao"], font=lbl_font_normal, text_color=("#555555", "#CCCCCC"), wraplength=450, justify="left", anchor="w")
+                desc_label.pack(fill="x", padx=15, pady=(4, 12))
+                
+                # Ações do cartão
+                actions_bar = ctk.CTkFrame(card, fg_color="transparent")
+                actions_bar.pack(fill="x", padx=15, pady=(0, 12))
+                
+                def carregar_para_edicao(anot=a):
+                    editando_sonho_id[0] = anot["id"]
+                    editando_versao[0] = anot["version"]
+                    
+                    lbl_form_title.configure(text="✏️ Editar Anotação", text_color="#E67E22")
+                    entry_titulo.delete(0, "end")
+                    entry_titulo.insert(0, anot["titulo"])
+                    entry_cat.delete(0, "end")
+                    entry_cat.insert(0, anot["categoria"])
+                    txt_desc.delete("1.0", "end")
+                    txt_desc.insert("1.0", anot["descricao"])
+                    btn_salvar.configure(text="Salvar Alterações")
+                    btn_limpar.configure(text="Cancelar")
+                    entry_titulo.focus()
+                    
+                def deletar_anotacao(anot=a):
+                    if messagebox.askyesno("Confirmar Exclusão", f"Deseja realmente excluir a anotação '{anot['titulo']}'?", parent=window):
+                        try:
+                            self.sonhos_service.remover_sonho(anot["id"], usuario_id)
+                            messagebox.showinfo("Sucesso", "Anotação excluída!", parent=window)
+                            if editando_sonho_id[0] == anot["id"]:
+                                resetar_formulario()
+                            carregar_anotacoes()
+                        except Exception as e:
+                            messagebox.showerror("Erro ao Deletar", f"Não foi possível excluir: {e}", parent=window)
+                
+                # Botões rápidos com hover
+                btn_edit = ctk.CTkButton(actions_bar, text="✏️ Editar", width=75, height=26, fg_color=("#E5F3FD", "#1D3244"), text_color=("#2980B9", "#7BBDE8"), hover_color=("#D1E9FC", "#284A65"), font=ctk.CTkFont(family="Aileron", size=10, weight="bold"), command=carregar_para_edicao)
+                btn_edit.pack(side="left", padx=(0, 8))
+                
+                btn_del = ctk.CTkButton(actions_bar, text="✕ Excluir", width=75, height=26, fg_color=("#FCE4D6", "#3E211F"), text_color=("#C0392B", "#E74C3C"), hover_color=("#FADBD8", "#542D2A"), font=ctk.CTkFont(family="Aileron", size=10, weight="bold"), command=deletar_anotacao)
+                btn_del.pack(side="left")
+
+        def carregar_anotacoes():
+            nonlocal anotacoes_cache
+            try:
+                # Obter do sqlite via sonhos_service
+                anotacoes_cache = self.sonhos_service.listar_sonhos()
+                
+                # Coletar categorias exclusivas para o Combobox
+                cats = {"Todas as Categorias"}
+                for a in anotacoes_cache:
+                    if a["categoria"]:
+                        cats.add(a["categoria"])
+                        
+                combo_filtro_cat.configure(values=list(cats))
+                renderizar_anotacoes_filtradas()
+            except Exception as e:
+                logger.warning("Erro carregar anotações: %s", e)
+                
+        # Ouvir alterações na pesquisa e no combobox
+        entry_busca.bind("<KeyRelease>", lambda e: renderizar_anotacoes_filtradas())
+        combo_filtro_cat.configure(command=lambda e: renderizar_anotacoes_filtradas())
+        
+        # Carregar na abertura
+        carregar_anotacoes()
+
+    # --- Importar Produtos via CSV/PDF ---
+    def open_importar_csv(self):
+        filepath = filedialog.askopenfilename(
+            title="Selecionar arquivo CSV ou PDF",
+            filetypes=[("CSV Files", "*.csv"), ("PDF Files", "*.pdf"), ("Todos", "*.*")]
+        )
+        if not filepath:
+            return
+        
+        # Preview
+        try:
+            if filepath.lower().endswith('.pdf'):
+                df_preview = self._ler_tabela_pdf(filepath, nrows=5)
+            else:
+                df_preview = pd.read_csv(filepath, nrows=5)
+            
+            if df_preview is None or df_preview.empty:
+                messagebox.showerror("Erro", "Nenhuma tabela encontrada no arquivo.", parent=self)
+                return
+            
+            msg = f"Colunas encontradas:\n{', '.join(df_preview.columns)}\n\nPrimeiras 5 linhas:\n"
+            for _, r in df_preview.iterrows():
+                msg += f"  {r.to_dict()}\n"
+            msg += "\nColunas obrigatórias: nome (ou Item/Produto), quantidade (ou Qtd), preco (ou Preço/Valor)\nOpcionais: categoria, subcategoria, sub_subcategoria, tamanho, preco_compra, codigo_barras, data_validade\n\n✅ O sistema reconhece automaticamente variações de nomes de colunas."
+            
+            if messagebox.askyesno("Confirmar Importação", msg, parent=self):
+                if filepath.lower().endswith('.pdf'):
+                    ok, result = self.db.importar_produtos_pdf(filepath)
+                else:
+                    ok, result = self.db.importar_produtos_csv(filepath)
+                if ok:
+                    messagebox.showinfo("Sucesso", result, parent=self)
+                    self.refresh_dashboard()
+                else:
+                    messagebox.showerror("Erro", result, parent=self)
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao ler arquivo: {e}", parent=self)
+
+    def _ler_tabela_pdf(self, filepath, nrows=None):
+        """Extrai a primeira tabela de um PDF usando pdfplumber."""
+        try:
+            import pdfplumber
+            all_rows = []
+            with pdfplumber.open(filepath) as pdf:
+                for page in pdf.pages:
+                    tables = page.extract_tables()
+                    for table in tables:
+                        if not table:
+                            continue
+                        if not all_rows:
+                            # Primeira tabela: usar primeira linha como cabeçalho
+                            header = [str(c).strip().lower() if c else f'col_{i}' for i, c in enumerate(table[0])]
+                            all_rows = []
+                            data_rows = table[1:]
+                        else:
+                            data_rows = table
+                        for row in data_rows:
+                            all_rows.append(row)
+            if not all_rows:
+                return None
+            df = pd.DataFrame(all_rows, columns=header)
+            # Limpar espaços dos nomes de colunas
+            df.columns = [c.strip() for c in df.columns]
+            if nrows:
+                df = df.head(nrows)
+            return df
+        except ImportError:
+            messagebox.showerror("Erro", "Biblioteca 'pdfplumber' não instalada.\nInstale com: pip install pdfplumber", parent=self)
+            return None
+        except Exception as e:
+            logger.error("Erro ao ler PDF: %s", e)
+            return None
+
+    def open_report_dialog(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Relatórios & Inteligência de Negócio")
+        window.geometry("1000x750")
+        window.attributes("-topmost", True)
+        
+        # Tabview structure
+        tabview = ctk.CTkTabview(window, width=900, height=650)
+        tabview.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        tab_dashboard = tabview.add("Dashboard & IA")
+        tab_vendas = tabview.add("Vendas")
+        tab_lucro = tabview.add("Lucro & Ranking")
+        tab_fiado = tabview.add("Fiados")
+        tab_historico = tabview.add("Histórico Completo")
+        
+        # =======================
+        # TAB 1: DASHBOARD
+        # =======================
+        
+        # Helpers for fetching data
+        today_str = datetime.date.today().isoformat()
+        
+        # 1. Total Sales Today
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT SUM(valor) FROM entradas WHERE data = ?", (today_str,))
+            res = cursor.fetchone()[0]
+            sales_today = res if res else 0.0
+        except Exception: sales_today = 0.0
+
+        # 2. Count Sales Today
+        try:
+            # Looking for "Venda" actions in historico for today. 
+            # Note: historico uses datetime string "YYYY-MM-DD HH:MM:SS"
+            cursor.execute("SELECT COUNT(*) FROM historico WHERE acao LIKE 'Venda%' AND data_hora LIKE ?", (f"{today_str}%",))
+            count_sales_today = cursor.fetchone()[0]
+        except Exception: count_sales_today = 0
+        
+        # 3. AI Prediction (Next Month Expenses)
+        try:
+            predictor = ai_module.ExpensePredictor(self.db)
+            prediction = predictor.predict_next_month()
+            pred_text = f"R$ {prediction:.2f}"
+            pred_details = "Baseado no histórico de gastos (IA)"
+        except Exception as e:
+            pred_text = "R$ 0.00"
+            pred_details = "Dados insuficientes para previsão."
+
+        # UI Layout for Dashboard
+        dash_frame = ctk.CTkScrollableFrame(tab_dashboard, fg_color="transparent")
+        dash_frame.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(dash_frame, text=f"Visão Geral - {datetime.date.today().strftime('%d/%m/%Y')}", 
+                    font=("Aileron", 20, "bold"), text_color=("#001D39", "white")).pack(pady=10, anchor="w")
+
+        # KPI Cards Row
+        kpi_row = ctk.CTkFrame(dash_frame, fg_color="transparent")
+        kpi_row.pack(fill="x", pady=10)
+        
+        def create_card(parent, title, value, subtext, color):
+            card = ctk.CTkFrame(parent, fg_color=color, corner_radius=15)
+            card.pack(side="left", fill="both", expand=True, padx=5)
+            ctk.CTkLabel(card, text=title, font=("Aileron", 14, "bold"), text_color="white").pack(pady=(15,5), padx=10)
+            ctk.CTkLabel(card, text=value, font=("Aileron", 24, "bold"), text_color="white").pack(pady=5, padx=10)
+            ctk.CTkLabel(card, text=subtext, font=("Aileron", 11), text_color="#E0E0E0").pack(pady=(0,15), padx=10)
+
+        create_card(kpi_row, "Faturamento Hoje", f"R$ {sales_today:.2f}", f"{count_sales_today} vendas realizadas", "#28a745")
+        create_card(kpi_row, "Previsão Gastos (Próx. Mês)", pred_text, pred_details, "#0A4174")
+
+        # Lucro e Fiado KPI
+        try:
+            lucro_mes, fat_mes = self.db.lucro_por_periodo("mes")
+            fiado_pend = self.db.total_fiado_pendente()
+        except Exception:
+            lucro_mes, fat_mes, fiado_pend = 0, 0, 0
+
+        kpi_row2 = ctk.CTkFrame(dash_frame, fg_color="transparent")
+        kpi_row2.pack(fill="x", pady=5)
+        create_card(kpi_row2, "Lucro do Mês", f"R$ {lucro_mes:.2f}", f"Faturamento: R$ {fat_mes:.2f}", "#6C3483")
+        create_card(kpi_row2, "Fiados Pendentes", f"R$ {fiado_pend:.2f}", "Contas a receber", "#E67E22" if fiado_pend > 0 else "#28a745")
+
+        # Comparativo Mensal
+        try:
+            comp = self.db.comparativo_mensal()
+            fat_atual = comp['atual']['faturamento']
+            fat_ant = comp['anterior']['faturamento']
+            variacao = ((fat_atual - fat_ant) / fat_ant * 100) if fat_ant > 0 else 0
+            seta = "▲" if variacao >= 0 else "▼"
+            cor_var = "#28a745" if variacao >= 0 else "#FF6B6B"
+        except Exception:
+            fat_atual = fat_ant = variacao = 0
+            seta = "—"
+            cor_var = "gray"
+
+        kpi_row3 = ctk.CTkFrame(dash_frame, fg_color="transparent")
+        kpi_row3.pack(fill="x", pady=5)
+        create_card(kpi_row3, "Mês Atual", f"R$ {fat_atual:.2f}", f"{seta} {variacao:+.1f}% vs anterior", cor_var)
+        create_card(kpi_row3, "Mês Anterior", f"R$ {fat_ant:.2f}", "Faturamento do mês passado", "#5D6D7E")
+
+        # Stock Alert Section
+        ctk.CTkLabel(dash_frame, text="Alertas de Estoque Baixo", font=("Aileron", 16, "bold"), text_color="#FF6B6B").pack(pady=(20, 5), anchor="w")
+        
+        alert_frame = ctk.CTkFrame(dash_frame, fg_color=("white", "#2B2B2B"))
+        alert_frame.pack(fill="x")
+        
+        # Check for low stock (usa estoque mínimo configurável por produto)
+        try:
+            df_prods = self.db.produtos_abaixo_estoque_minimo()
+            if df_prods.empty:
+                ctk.CTkLabel(alert_frame, text="Nenhum produto com estoque crítico.", text_color="gray").pack(pady=20)
+            else:
+                for _, row in df_prods.iterrows():
+                    ctk.CTkLabel(alert_frame, text=f"• {row['nome']} (Restam: {row['quantidade']})", 
+                                font=("Aileron", 12, "bold"), text_color="#FF6B6B", anchor="w").pack(fill="x", padx=15, pady=2)
+        except Exception: pass
+
+        # Alerta de Validade
+        ctk.CTkLabel(dash_frame, text="Produtos com Validade Próxima", font=("Aileron", 16, "bold"), text_color="#E67E22").pack(pady=(20, 5), anchor="w")
+        val_frame = ctk.CTkFrame(dash_frame, fg_color=("white", "#2B2B2B"))
+        val_frame.pack(fill="x")
+        try:
+            df_venc = self.db.verificar_produtos_vencendo(dias_alerta=7)
+            if df_venc.empty:
+                ctk.CTkLabel(val_frame, text="Nenhum produto vencendo nos próximos 7 dias.", text_color="gray").pack(pady=20)
+            else:
+                for _, row in df_venc.iterrows():
+                    venc_date = row['data_validade']
+                    is_vencido = venc_date < datetime.date.today().isoformat()
+                    status_txt = "VENCIDO!" if is_vencido else f"Vence: {venc_date}"
+                    cor = "#FF0000" if is_vencido else "#E67E22"
+                    ctk.CTkLabel(val_frame, text=f"• {row['nome']} (Qtd: {row['quantidade']}) - {status_txt}",
+                                font=("Aileron", 12, "bold"), text_color=cor, anchor="w").pack(fill="x", padx=15, pady=2)
+        except Exception: pass
+
+        # =======================
+        # TAB 2: VENDAS
+        # =======================
+        vendas_scroll = ctk.CTkScrollableFrame(tab_vendas, fg_color="transparent")
+        vendas_scroll.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(vendas_scroll, text="Histórico de Vendas", font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack(pady=10, anchor="w")
+
+        # Filtros de vendas
+        vf_frame = ctk.CTkFrame(vendas_scroll, fg_color=("white", "#2B2B2B"), corner_radius=10)
+        vf_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(vf_frame, text="Período:", font=("Aileron", 11, "bold")).pack(side="left", padx=10, pady=10)
+        combo_venda_periodo = ctk.CTkComboBox(vf_frame, values=["Hoje", "Semana", "Mês", "Ano", "Todos"], width=120)
+        combo_venda_periodo.set("Mês")
+        combo_venda_periodo.pack(side="left", padx=5)
+
+        # Treeview de vendas
+        vt_frame = ctk.CTkFrame(vendas_scroll, fg_color="transparent", height=300)
+        vt_frame.pack(fill="both", expand=True, pady=5)
+        vt_frame.pack_propagate(False)
+
+        v_cols = ("id", "data", "produto", "qtd", "valor", "lucro", "pgto", "cliente", "status")
+        tree_vendas = ttk.Treeview(vt_frame, columns=v_cols, show="headings", height=12)
+        for c, w in [("id", 40), ("data", 130), ("produto", 120), ("qtd", 50), ("valor", 80), ("lucro", 70), ("pgto", 90), ("cliente", 100), ("status", 80)]:
+            tree_vendas.heading(c, text=c.capitalize())
+            tree_vendas.column(c, width=w, anchor="center" if c in ("id", "qtd") else "w")
+        tree_vendas.pack(side="left", fill="both", expand=True)
+        ttk.Scrollbar(vt_frame, orient="vertical", command=tree_vendas.yview).pack(side="right", fill="y")
+
+        def carregar_vendas():
+            for i in tree_vendas.get_children(): tree_vendas.delete(i)
+            periodo_map = {"Hoje": "hoje", "Semana": "semana", "Mês": "mes", "Ano": "ano", "Todos": "todos"}
+            per = periodo_map.get(combo_venda_periodo.get(), "todos")
+            try:
+                df_v = self.db.listar_vendas(per)
+                if df_v.empty: return
+                # Buscar nomes de produtos
+                df_p = self.db.listar_produtos()
+                prod_names = dict(zip(df_p['id'], df_p['nome'])) if not df_p.empty else {}
+                for _, r in df_v.iterrows():
+                    p_nome = prod_names.get(r.get('produto_id'), 'Kit/Outro')
+                    data_fmt = str(r.get('data_venda', ''))[:16]
+                    tree_vendas.insert("", "end", values=(
+                        r.get('id'), data_fmt, p_nome, r.get('quantidade'),
+                        f"R$ {r.get('valor_total', 0):.2f}", f"R$ {r.get('lucro', 0):.2f}",
+                        r.get('forma_pagamento', 'N/A'), r.get('cliente', 'N/A'), r.get('status', 'N/A')
+                    ))
+            except Exception as e:
+                logger.warning("Erro ao listar vendas: %s", e)
+
+        ctk.CTkButton(vf_frame, text="Filtrar", command=carregar_vendas, width=80, fg_color="#7BBDE8", text_color="#001D39").pack(side="left", padx=10)
+
+        # Botão cancelar venda
+        def cancelar_venda_selecionada():
+            sel = tree_vendas.selection()
+            if not sel:
+                messagebox.showwarning("Aviso", "Selecione uma venda para cancelar.", parent=window)
+                return
+            venda_id = tree_vendas.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirmar", f"Cancelar venda #{venda_id}?\nO estoque será devolvido.", parent=window):
+                ok, msg = self.db.cancelar_venda(venda_id)
+                messagebox.showinfo("Resultado", msg, parent=window)
+                carregar_vendas()
+
+        ctk.CTkButton(vf_frame, text="Cancelar Venda", command=cancelar_venda_selecionada, width=120, fg_color="#FF6B6B", hover_color="#FF5252", text_color="white").pack(side="right", padx=10)
+
+        # Vendas por forma de pagamento
+        ctk.CTkLabel(vendas_scroll, text="Vendas por Forma de Pagamento (Mês)", font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), anchor="w")
+        try:
+            df_pgto = self.db.vendas_por_forma_pagamento("mes")
+            if not df_pgto.empty:
+                pgto_frame_r = ctk.CTkFrame(vendas_scroll, fg_color=("white", "#2B2B2B"), corner_radius=10)
+                pgto_frame_r.pack(fill="x", pady=5)
+                for _, r in df_pgto.iterrows():
+                    ctk.CTkLabel(pgto_frame_r, text=f"  {r['forma']}: R$ {r['total']:.2f} ({int(r['qtd'])} vendas)",
+                                font=("Aileron", 12), text_color=("#333", "white"), anchor="w").pack(fill="x", padx=15, pady=3)
+            else:
+                ctk.CTkLabel(vendas_scroll, text="Sem dados de vendas este mês.", text_color="gray").pack()
+        except Exception: pass
+
+        carregar_vendas()
+
+        # =======================
+        # TAB 3: LUCRO & RANKING
+        # =======================
+        lucro_scroll = ctk.CTkScrollableFrame(tab_lucro, fg_color="transparent")
+        lucro_scroll.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(lucro_scroll, text="Análise de Lucro & Ranking", font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack(pady=10, anchor="w")
+
+        # Lucro por período
+        lucro_cards = ctk.CTkFrame(lucro_scroll, fg_color="transparent")
+        lucro_cards.pack(fill="x", pady=5)
+        for label, per in [("Hoje", "hoje"), ("Semana", "semana"), ("Mês", "mes"), ("Ano", "ano")]:
+            try:
+                l, f = self.db.lucro_por_periodo(per)
+            except Exception:
+                l, f = 0, 0
+            create_card(lucro_cards, f"Lucro {label}", f"R$ {l:.2f}", f"Fat: R$ {f:.2f}", "#6C3483")
+
+        # Ranking de Produtos
+        ctk.CTkLabel(lucro_scroll, text="Top 10 Produtos Mais Vendidos (Mês)", font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), anchor="w")
+        try:
+            df_rank = self.db.ranking_produtos_vendidos("mes", 10)
+            if not df_rank.empty:
+                rank_frame = ctk.CTkFrame(lucro_scroll, fg_color="transparent", height=200)
+                rank_frame.pack(fill="both", expand=True, pady=5)
+                rank_frame.pack_propagate(False)
+                r_cols = ("pos", "produto", "qtd", "faturamento", "lucro")
+                tree_rank = ttk.Treeview(rank_frame, columns=r_cols, show="headings", height=10)
+                for c, h, w in [("pos", "#", 30), ("produto", "Produto", 180), ("qtd", "Qtd Vendida", 80), ("faturamento", "Faturamento", 100), ("lucro", "Lucro", 100)]:
+                    tree_rank.heading(c, text=h)
+                    tree_rank.column(c, width=w, anchor="center" if c in ("pos", "qtd") else "w")
+                tree_rank.pack(fill="both", expand=True)
+                for i, (_, r) in enumerate(df_rank.iterrows(), 1):
+                    tree_rank.insert("", "end", values=(i, r['nome'] or 'N/A', int(r['total_vendido']), f"R$ {r['faturamento']:.2f}", f"R$ {r['lucro_total']:.2f}"))
+            else:
+                ctk.CTkLabel(lucro_scroll, text="Sem dados de vendas para ranking.", text_color="gray").pack()
+        except Exception as e:
+            logger.warning("Erro ranking: %s", e)
+
+        # Ranking de Lucro por Produto/Tamanho
+        ctk.CTkLabel(lucro_scroll, text="Top 10 Lucro por Produto / Tamanho (Mês)", font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), anchor="w")
+        try:
+            df_lucro_tam = self.db.ranking_produtos_por_lucro("mes", 10)
+            if not df_lucro_tam.empty:
+                lt_frame = ctk.CTkFrame(lucro_scroll, fg_color="transparent", height=200)
+                lt_frame.pack(fill="both", expand=True, pady=5)
+                lt_frame.pack_propagate(False)
+                lt_cols = ("pos", "produto", "tamanho", "qtd", "faturamento", "lucro")
+                tree_lt = ttk.Treeview(lt_frame, columns=lt_cols, show="headings", height=10)
+                for c, h, w in [("pos", "#", 30), ("produto", "Produto", 160), ("tamanho", "Tamanho", 80), ("qtd", "Qtd", 60), ("faturamento", "Faturamento", 100), ("lucro", "Lucro", 100)]:
+                    tree_lt.heading(c, text=h)
+                    tree_lt.column(c, width=w, anchor="center" if c in ("pos", "qtd", "tamanho") else "w")
+                tree_lt.pack(fill="both", expand=True)
+                for i, (_, r) in enumerate(df_lucro_tam.iterrows(), 1):
+                    tam = r.get('tamanho', '') or 'Único'
+                    tree_lt.insert("", "end", values=(i, r['nome'] or 'N/A', tam, int(r['total_vendido']), f"R$ {r['faturamento']:.2f}", f"R$ {r['lucro_total']:.2f}"))
+            else:
+                ctk.CTkLabel(lucro_scroll, text="Sem dados de lucro por tamanho.", text_color="gray").pack()
+        except Exception as e:
+            logger.warning("Erro ranking lucro tamanho: %s", e)
+
+        # Curva ABC (Análise de Pareto)
+        ctk.CTkLabel(lucro_scroll, text="📊 Curva ABC (Pareto) — Mês", font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), anchor="w")
+        try:
+            df_abc = self.db.curva_abc("mes")
+            if not df_abc.empty:
+                abc_frame = ctk.CTkFrame(lucro_scroll, fg_color="transparent", height=220)
+                abc_frame.pack(fill="both", expand=True, pady=5)
+                abc_frame.pack_propagate(False)
+                abc_cols = ("classe", "produto", "faturamento", "pct", "pct_acum")
+                tree_abc = ttk.Treeview(abc_frame, columns=abc_cols, show="headings", height=10)
+                for c, h, w in [("classe", "Classe", 50), ("produto", "Produto", 180), ("faturamento", "Faturamento", 100), ("pct", "% Fat.", 60), ("pct_acum", "% Acum.", 70)]:
+                    tree_abc.heading(c, text=h)
+                    tree_abc.column(c, width=w, anchor="center" if c != "produto" else "w")
+                tree_abc.tag_configure("A", background="#D4EDDA")
+                tree_abc.tag_configure("B", background="#FFF3CD")
+                tree_abc.tag_configure("C", background="#F8D7DA")
+                tree_abc.pack(fill="both", expand=True)
+                for _, r in df_abc.iterrows():
+                    tree_abc.insert("", "end", values=(
+                        r['classe'], r['nome'] or 'N/A',
+                        f"R$ {r['faturamento']:.2f}", f"{r['pct']:.1f}%", f"{r['pct_acum']:.1f}%"
+                    ), tags=(r['classe'],))
+                # Resumo
+                resumo_f = ctk.CTkFrame(lucro_scroll, fg_color="transparent")
+                resumo_f.pack(fill="x", pady=5)
+                for cls, cor, desc in [("A", "#28a745", "80% do faturamento"), ("B", "#ffc107", "15% do faturamento"), ("C", "#dc3545", "5% do faturamento")]:
+                    n = len(df_abc[df_abc['classe'] == cls])
+                    ctk.CTkLabel(resumo_f, text=f"  {cls}: {n} produtos ({desc})  ", font=("Aileron", 11, "bold"),
+                                fg_color=cor, text_color="white" if cls != "B" else "#333", corner_radius=5).pack(side="left", padx=3)
+            else:
+                ctk.CTkLabel(lucro_scroll, text="Sem dados de vendas para análise ABC.", text_color="gray").pack()
+        except Exception as e:
+            logger.warning("Erro curva ABC: %s", e)
+
+        # Gráfico de vendas ao longo do tempo
+        ctk.CTkLabel(lucro_scroll, text="Faturamento Diário (Últimos 30 dias)", font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), anchor="w")
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+            df_dias = self.db.vendas_por_dia(30)
+            if not df_dias.empty:
+                fig = Figure(figsize=(9, 3), dpi=80)
+                ax = fig.add_subplot(111)
+                ax.fill_between(range(len(df_dias)), df_dias['faturamento'], alpha=0.3, color='#28a745')
+                ax.plot(range(len(df_dias)), df_dias['faturamento'], color='#28a745', linewidth=2, marker='o', markersize=3)
+                ax.plot(range(len(df_dias)), df_dias['lucro'], color='#6C3483', linewidth=2, linestyle='--', marker='s', markersize=3)
+                ax.set_xticks(range(0, len(df_dias), max(1, len(df_dias) // 7)))
+                ax.set_xticklabels([str(d)[-5:] for d in df_dias['dia'].iloc[::max(1, len(df_dias) // 7)]], rotation=45, fontsize=7)
+                ax.set_ylabel("R$", fontsize=9)
+                ax.legend(["Faturamento", "Lucro"], fontsize=8)
+                ax.grid(True, alpha=0.3)
+                is_dark = ctk.get_appearance_mode() == "Dark"
+                if is_dark:
+                    fig.patch.set_facecolor('#2B2B2B')
+                    ax.set_facecolor('#333333')
+                    ax.tick_params(colors='white')
+                    ax.yaxis.label.set_color('white')
+                    ax.xaxis.label.set_color('white')
+                    for spine in ax.spines.values():
+                        spine.set_color('#555555')
+                fig.tight_layout()
+                chart_frame = ctk.CTkFrame(lucro_scroll, fg_color="transparent", height=250)
+                chart_frame.pack(fill="x", pady=5)
+                chart_frame.pack_propagate(False)
+                canvas = FigureCanvasTkAgg(fig, master=chart_frame)
+                canvas.draw()
+                canvas.get_tk_widget().pack(fill="both", expand=True)
+            else:
+                ctk.CTkLabel(lucro_scroll, text="Sem dados de vendas para gráfico.", text_color="gray").pack()
+        except Exception as e:
+            logger.warning("Erro gráfico temporal: %s", e)
+
+        # =======================
+        # TAB 4: FIADOS / CONTAS A RECEBER
+        # =======================
+        fiado_scroll = ctk.CTkScrollableFrame(tab_fiado, fg_color="transparent")
+        fiado_scroll.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(fiado_scroll, text="Contas a Receber (Fiado)", font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack(pady=10, anchor="w")
+
+        # Total pendente
+        try:
+            total_fiado = self.db.total_fiado_pendente()
+        except Exception:
+            total_fiado = 0
+        ctk.CTkLabel(fiado_scroll, text=f"Total Pendente: R$ {total_fiado:.2f}", font=("Aileron", 16, "bold"),
+                    text_color="#E67E22" if total_fiado > 0 else "#28a745").pack(pady=5, anchor="w")
+
+        # Filtro
+        ff_frame = ctk.CTkFrame(fiado_scroll, fg_color=("white", "#2B2B2B"), corner_radius=10)
+        ff_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(ff_frame, text="Status:", font=("Aileron", 11, "bold")).pack(side="left", padx=10, pady=10)
+        combo_fiado_status = ctk.CTkComboBox(ff_frame, values=["Pendente", "Pago", "Todos"], width=120)
+        combo_fiado_status.set("Pendente")
+        combo_fiado_status.pack(side="left", padx=5)
+
+        ft_frame = ctk.CTkFrame(fiado_scroll, fg_color="transparent", height=250)
+        ft_frame.pack(fill="both", expand=True, pady=5)
+        ft_frame.pack_propagate(False)
+
+        f_cols = ("id", "cliente", "valor", "data_venda", "vencimento", "status")
+        tree_fiado = ttk.Treeview(ft_frame, columns=f_cols, show="headings", height=10)
+        for c, h, w in [("id", "ID", 40), ("cliente", "Cliente", 150), ("valor", "Valor", 100), ("data_venda", "Data Venda", 100), ("vencimento", "Vencimento", 100), ("status", "Status", 80)]:
+            tree_fiado.heading(c, text=h)
+            tree_fiado.column(c, width=w, anchor="center" if c == "id" else "w")
+        tree_fiado.pack(side="left", fill="both", expand=True)
+        ttk.Scrollbar(ft_frame, orient="vertical", command=tree_fiado.yview).pack(side="right", fill="y")
+
+        def carregar_fiados():
+            for i in tree_fiado.get_children(): tree_fiado.delete(i)
+            status = combo_fiado_status.get()
+            status_param = None if status == "Todos" else status
+            try:
+                df_f = self.db.listar_fiados(status=status_param)
+                for _, r in df_f.iterrows():
+                    tree_fiado.insert("", "end", values=(
+                        r['id'], r.get('cliente_nome', 'N/A'), f"R$ {r['valor']:.2f}",
+                        r['data_venda'], r.get('data_vencimento', 'N/A'), r['status']
+                    ))
+            except Exception as e:
+                logger.warning("Erro ao listar fiados: %s", e)
+
+        ctk.CTkButton(ff_frame, text="Filtrar", command=carregar_fiados, width=80, fg_color="#7BBDE8", text_color="#001D39").pack(side="left", padx=10)
+
+        def quitar_selecionado():
+            sel = tree_fiado.selection()
+            if not sel:
+                messagebox.showwarning("Aviso", "Selecione uma conta para quitar.", parent=window)
+                return
+            conta_id = tree_fiado.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirmar", f"Marcar conta #{conta_id} como paga?", parent=window):
+                self.db.quitar_fiado(conta_id)
+                messagebox.showinfo("Sucesso", "Conta quitada!", parent=window)
+                carregar_fiados()
+
+        ctk.CTkButton(ff_frame, text="Quitar Selecionado", command=quitar_selecionado, width=140, fg_color="#28a745", hover_color="#218838").pack(side="right", padx=10)
+
+        carregar_fiados()
+
+        # =======================
+        # TAB 2: HISTORY (Existing Logic Improved)
+        # =======================
+        
+        filter_frame = ctk.CTkFrame(tab_historico, fg_color=("white", "#2B2B2B"), corner_radius=10)
+        filter_frame.pack(fill="x", pady=(0, 15))
+        
+        ctk.CTkLabel(filter_frame, text="Filtros:", font=("Aileron", 12, "bold")).pack(side="left", padx=15, pady=15)
+        
+        combo_tipo = ctk.CTkComboBox(filter_frame, values=["Tudo", "Venda", "Estoque", "Financeiro", "Sistema"], width=150)
+        combo_tipo.set("Tudo")
+        combo_tipo.pack(side="left", padx=5)
+        
+        combo_periodo = ctk.CTkComboBox(filter_frame, values=["Histórico Completo", "Hoje", "Últimos 7 dias", "Últimos 30 dias"], width=150)
+        combo_periodo.set("Histórico Completo")
+        combo_periodo.pack(side="left", padx=5)
+        
+        # Table
+        table_frame = ctk.CTkFrame(tab_historico, fg_color="transparent")
+        table_frame.pack(fill="both", expand=True)
+        
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", background="#2B2B2B", fieldbackground="#2B2B2B", foreground="white", rowheight=30, borderwidth=0)
+        style.configure("Treeview.Heading", background="#404040", foreground="white", relief="flat", font=('Aileron', 10, 'bold'))
+        style.map("Treeview", background=[('selected', '#10367D')])
+        
+        columns = ("ID", "Data/Hora", "Ação", "Detalhes")
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        
+        tree.heading("ID", text="ID")
+        tree.heading("Data/Hora", text="Data/Hora")
+        tree.heading("Ação", text="Tipo / Ação")
+        tree.heading("Detalhes", text="Detalhes")
+        
+        tree.column("ID", width=50, anchor="center")
+        tree.column("Data/Hora", width=150, anchor="center")
+        tree.column("Ação", width=150)
+        tree.column("Detalhes", width=400)
+        
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=scrollbar.set)
+        
+        def aplicar_filtro():
+            # Limpar
+            for i in tree.get_children(): tree.delete(i)
+            
+            tipo = combo_tipo.get()
+            periodo = combo_periodo.get()
+            
+            # Construir query base
+            # Note: SQLite date comparisons on strings work if format is ISO YYYY-MM-DD
+            query = "SELECT * FROM historico"
+            params = []
+            conditions = []
+            
+            # Filtro Data (Naive implementation assuming YYYY-MM-DD starts)
+            today = datetime.date.today()
+            if periodo == "Hoje":
+                conditions.append("data_hora LIKE ?")
+                params.append(f"{today.isoformat()}%")
+            elif periodo == "Últimos 7 dias":
+                limit_date = today - datetime.timedelta(days=7)
+                conditions.append("data_hora >= ?")
+                params.append(limit_date.isoformat())
+            elif periodo == "Últimos 30 dias":
+                limit_date = today - datetime.timedelta(days=30)
+                conditions.append("data_hora >= ?")
+                params.append(limit_date.isoformat())
+                
+            # Combinar SQL
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            
+            query += " ORDER BY id DESC"
+            
+            try:
+                df = pd.read_sql_query(query, self.db.conn, params=params)
+                
+                if df.empty: return
+                
+                for _, row in df.iterrows():
+                    # Filtro "Tipo" em memória (mais fácil que SQL complexo para texto vago)
+                    if tipo != "Tudo":
+                        matches = False
+                        acao_lower = row['acao'].lower()
+                        if tipo == "Venda" and ("venda" in acao_lower or "saída" in acao_lower): matches = True
+                        elif tipo == "Estoque" and ("produto" in acao_lower or "estoque" in acao_lower or "kit" in acao_lower): matches = True
+                        elif tipo == "Financeiro" and ("gasto" in acao_lower or "saldo" in acao_lower or "pagamento" in acao_lower): matches = True
+                        elif tipo == "Sistema" and ("login" in acao_lower or "config" in acao_lower): matches = True
+                        
+                        if not matches: continue
+                    
+                    tree.insert("", "end", values=(row['id'], row['data_hora'], row['acao'], row['detalhe']))
+            except Exception as e:
+                logger.warning("Erro filtro: %s", e)
+        
+        ctk.CTkButton(filter_frame, text="Aplicar Filtros", command=aplicar_filtro, width=120, fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F").pack(side="left", padx=15)
+        
+        def exportar_csv():
+            filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")])
+            if filename:
+                df = pd.read_sql_query("SELECT * FROM historico", self.db.conn)
+                df.to_csv(filename, index=False)
+                messagebox.showinfo("Sucesso", "Relatório exportado!", parent=window)
+        
+        ctk.CTkButton(filter_frame, text="Exportar Dados (CSV)", command=exportar_csv, width=150, fg_color="#0A4174", hover_color="#062F56").pack(side="right", padx=15)
+        
+        aplicar_filtro()
+
+    # ==================== INSUMOS / MATÉRIA-PRIMA ====================
+
+    def open_insumos_manager(self):
+        """Gerenciador de insumos com baixa manual e ficha técnica."""
+        window = ctk.CTkToplevel(self)
+        window.title("Gerenciador de Insumos")
+        window.geometry("900x650")
+        window.attributes("-topmost", True)
+
+        tabview = ctk.CTkTabview(window, fg_color="transparent")
+        tabview.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tab_lista = tabview.add("Estoque de Insumos")
+        tab_baixa = tabview.add("Baixa de Insumos")
+        tab_fichas = tabview.add("Fichas Técnicas")
+
+        # ===== ABA 1: ESTOQUE DE INSUMOS =====
+        def refresh_insumos_list():
+            for w in insumos_scroll.winfo_children():
+                w.destroy()
+            df_insumos = self.db.listar_insumos()
+            if df_insumos.empty:
+                ctk.CTkLabel(insumos_scroll, text="Nenhum insumo cadastrado.\nCadastre um produto com Tipo = 'insumo' na tela Adicionar.",
+                            font=("Aileron", 12), text_color="gray").pack(pady=30)
+                return
+            for _, row in df_insumos.iterrows():
+                f = ctk.CTkFrame(insumos_scroll, fg_color=("white", "#3A3A3A"), corner_radius=10,
+                                border_width=1, border_color=("#7BBDE8", "#49769F"))
+                f.pack(fill="x", pady=3, padx=5)
+                un = row.get('unidade_medida', 'un') or 'un'
+                txt = f"{row['nome']}  —  Estoque: {row['quantidade']} {un}"
+                if row.get('categoria'):
+                    txt += f"  |  {row['categoria']}"
+                ctk.CTkLabel(f, text=txt, font=("Aileron", 12), anchor="w",
+                            text_color=("#333", "white")).pack(side="left", padx=15, pady=10, fill="x", expand=True)
+                # Indicador visual de estoque baixo
+                est_min = row.get('estoque_minimo', 5) or 5
+                if row['quantidade'] <= est_min:
+                    ctk.CTkLabel(f, text="⚠ BAIXO", font=("Aileron", 10, "bold"),
+                                text_color="#FF6B6B").pack(side="right", padx=10)
+
+        ctk.CTkLabel(tab_lista, text="Estoque de Insumos / Matéria-Prima",
+                    font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=10)
+        ctk.CTkLabel(tab_lista, text="Para cadastrar insumos, use ADICIONAR e selecione Tipo = 'insumo'.",
+                    font=("Aileron", 10, "italic"), text_color="gray").pack()
+        insumos_scroll = ctk.CTkScrollableFrame(tab_lista, fg_color="transparent")
+        insumos_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+        refresh_insumos_list()
+
+        # ===== ABA 2: BAIXA DE INSUMOS (uso diário) =====
+        ctk.CTkLabel(tab_baixa, text="Baixa de Insumos Usados",
+                    font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=10)
+        ctk.CTkLabel(tab_baixa, text="Registre os insumos que foram utilizados hoje.",
+                    font=("Aileron", 10, "italic"), text_color="gray").pack()
+
+        baixa_form = ctk.CTkFrame(tab_baixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        baixa_form.pack(fill="x", padx=15, pady=10)
+
+        df_ins_all = self.db.listar_insumos()
+        insumos_nomes = df_ins_all['nome'].tolist() if not df_ins_all.empty else ["(nenhum)"]
+        insumos_map = {}
+        if not df_ins_all.empty:
+            for _, r in df_ins_all.iterrows():
+                insumos_map[r['nome']] = r
+
+        ctk.CTkLabel(baixa_form, text="Insumo:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(10, 0))
+        combo_insumo = ctk.CTkComboBox(baixa_form, values=insumos_nomes, state="readonly")
+        combo_insumo.pack(fill="x", padx=15, pady=3)
+
+        ctk.CTkLabel(baixa_form, text="Quantidade:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        e_qtd_baixa = ctk.CTkEntry(baixa_form, placeholder_text="Ex: 2.5")
+        e_qtd_baixa.pack(fill="x", padx=15, pady=3)
+
+        ctk.CTkLabel(baixa_form, text="Motivo:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        e_motivo = ctk.CTkEntry(baixa_form, placeholder_text="Uso diário / Perda / Vencido...")
+        e_motivo.insert(0, "Uso diário")
+        e_motivo.pack(fill="x", padx=15, pady=3)
+
+        def _fazer_baixa():
+            nome_sel = combo_insumo.get()
+            if nome_sel not in insumos_map:
+                messagebox.showerror("Erro", "Selecione um insumo.", parent=window)
+                return
+            try:
+                qtd = float(e_qtd_baixa.get().replace(",", "."))
+                if qtd <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Erro", "Quantidade inválida.", parent=window)
+                return
+            motivo = e_motivo.get().strip() or "Uso diário"
+            ins_id = int(insumos_map[nome_sel]['id'])
+            ok, msg = self.db.registrar_baixa_insumo(ins_id, qtd, motivo)
+            if ok:
+                messagebox.showinfo("Sucesso", msg, parent=window)
+                e_qtd_baixa.delete(0, "end")
+                refresh_insumos_list()
+                _refresh_historico_baixas()
+                self.refresh_dashboard()
+            else:
+                messagebox.showerror("Erro", msg, parent=window)
+
+        ctk.CTkButton(baixa_form, text="REGISTRAR BAIXA", command=_fazer_baixa,
+                      height=40, fg_color="#D4A373", hover_color="#B8956A", text_color="white",
+                      font=("Aileron", 13, "bold")).pack(fill="x", padx=15, pady=15)
+
+        # Histórico de baixas
+        ctk.CTkLabel(tab_baixa, text="Histórico de Baixas (últimos 30 dias):",
+                    font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(anchor="w", padx=15, pady=(10, 5))
+        hist_baixa_scroll = ctk.CTkScrollableFrame(tab_baixa, fg_color="transparent", height=150)
+        hist_baixa_scroll.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        def _refresh_historico_baixas():
+            for w in hist_baixa_scroll.winfo_children():
+                w.destroy()
+            df_b = self.db.listar_baixas_insumos(30)
+            if df_b.empty:
+                ctk.CTkLabel(hist_baixa_scroll, text="Nenhuma baixa registrada.", text_color="gray").pack(pady=10)
+                return
+            for _, r in df_b.iterrows():
+                txt = f"{r['data']}  |  {r['insumo_nome']}  |  Qtd: {r['quantidade']}  |  {r['motivo']}"
+                ctk.CTkLabel(hist_baixa_scroll, text=txt, font=("Aileron", 10),
+                            text_color=("#555", "#CCC"), anchor="w").pack(fill="x", padx=5, pady=1)
+        _refresh_historico_baixas()
+
+        # ===== ABA 3: FICHAS TÉCNICAS =====
+        ctk.CTkLabel(tab_fichas, text="Fichas Técnicas / Receitas",
+                    font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=10)
+        ctk.CTkLabel(tab_fichas, text="Vincule insumos a um produto final para produção automática.",
+                    font=("Aileron", 10, "italic"), text_color="gray").pack()
+
+        fichas_scroll = ctk.CTkScrollableFrame(tab_fichas, fg_color="transparent")
+        fichas_scroll.pack(fill="both", expand=True, padx=10, pady=5)
+
+        def _refresh_fichas():
+            for w in fichas_scroll.winfo_children():
+                w.destroy()
+            df_fichas = self.db.listar_fichas_tecnicas()
+            if df_fichas.empty:
+                ctk.CTkLabel(fichas_scroll, text="Nenhuma ficha técnica cadastrada.",
+                            text_color="gray").pack(pady=20)
+                return
+            for _, r in df_fichas.iterrows():
+                f = ctk.CTkFrame(fichas_scroll, fg_color=("white", "#3A3A3A"), corner_radius=10,
+                                border_width=1, border_color=("#7BBDE8", "#49769F"))
+                f.pack(fill="x", pady=3, padx=5)
+                txt = f"📋 {r['nome']}  →  {r['produto_nome']}  (Rend: {r['rendimento']}un)"
+                ctk.CTkLabel(f, text=txt, font=("Aileron", 12), anchor="w",
+                            text_color=("#333", "white")).pack(side="left", padx=15, pady=10, fill="x", expand=True)
+                # Botão ver detalhes
+                ctk.CTkButton(f, text="Ver", width=50, fg_color="#7BBDE8", text_color="#001D39",
+                             command=lambda fid=r['id'], fn=r['nome']: _ver_ficha(fid, fn)).pack(side="right", padx=3, pady=5)
+                ctk.CTkButton(f, text="✕", width=30, fg_color="#FF6B6B", text_color="white",
+                             command=lambda fid=r['id']: (_remover_ficha(fid))).pack(side="right", padx=3, pady=5)
+
+        def _ver_ficha(ficha_id, ficha_nome):
+            df_itens = self.db.get_ficha_tecnica_itens(ficha_id)
+            if df_itens.empty:
+                messagebox.showinfo("Ficha Técnica", f"'{ficha_nome}' não tem insumos vinculados.", parent=window)
+                return
+            linhas = [f"📋 Ficha: {ficha_nome}\n"]
+            for _, it in df_itens.iterrows():
+                un = it.get('unidade_medida', 'un') or 'un'
+                linhas.append(f"  • {it['insumo_nome']}: {it['quantidade']} {un} (Estoque: {it['estoque_atual']})")
+            messagebox.showinfo("Ficha Técnica", "\n".join(linhas), parent=window)
+
+        def _remover_ficha(ficha_id):
+            if messagebox.askyesno("Confirmar", "Remover esta ficha técnica?", parent=window):
+                self.db.remover_ficha_tecnica(ficha_id)
+                _refresh_fichas()
+
+        _refresh_fichas()
+
+        # Botão criar nova ficha
+        ctk.CTkButton(tab_fichas, text="+ NOVA FICHA TÉCNICA", command=lambda: self._open_criar_ficha_dialog(window, _refresh_fichas),
+                      height=40, fg_color="#0A4174", hover_color="#062F56",
+                      font=("Aileron", 13, "bold")).pack(fill="x", padx=15, pady=10)
+
+    def _open_criar_ficha_dialog(self, parent_window, refresh_callback):
+        """Dialog para criar uma nova ficha técnica."""
+        dialog = ctk.CTkToplevel(parent_window)
+        dialog.title("Nova Ficha Técnica")
+        dialog.geometry("600x550")
+        dialog.attributes("-topmost", True)
+
+        main_frame = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(main_frame, text="Criar Ficha Técnica", font=("Aileron", 18, "bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 10))
+
+        # Produto final
+        ctk.CTkLabel(main_frame, text="Produto Final (que será produzido):", font=("Aileron", 11, "bold")).pack(anchor="w")
+        df_prods = self.db.listar_produtos()
+        df_vendaveis = df_prods[df_prods.get('tipo_produto', 'produto') != 'insumo'] if not df_prods.empty and 'tipo_produto' in df_prods.columns else df_prods
+        prods_names = df_vendaveis['nome'].tolist() if not df_vendaveis.empty else ["(nenhum)"]
+        prods_map = {}
+        if not df_vendaveis.empty:
+            for _, r in df_vendaveis.iterrows():
+                prods_map[r['nome']] = int(r['id'])
+        combo_prod = ctk.CTkComboBox(main_frame, values=prods_names, state="readonly")
+        combo_prod.pack(fill="x", pady=5)
+
+        # Nome da ficha
+        ctk.CTkLabel(main_frame, text="Nome da Ficha/Receita:", font=("Aileron", 11, "bold")).pack(anchor="w", pady=(10, 0))
+        e_nome_ficha = ctk.CTkEntry(main_frame, placeholder_text="Ex: Receita Pão Francês")
+        e_nome_ficha.pack(fill="x", pady=5)
+
+        # Rendimento
+        ctk.CTkLabel(main_frame, text="Rendimento (unidades produzidas):", font=("Aileron", 11, "bold")).pack(anchor="w", pady=(10, 0))
+        e_rendimento = ctk.CTkEntry(main_frame, placeholder_text="Ex: 50")
+        e_rendimento.insert(0, "1")
+        e_rendimento.pack(fill="x", pady=5)
+
+        # Insumos da receita
+        ctk.CTkLabel(main_frame, text="Insumos da Receita:", font=("Aileron", 13, "bold"),
+                    text_color="#D4A373").pack(anchor="w", pady=(15, 5))
+
+        itens_ficha = []
+        itens_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        itens_frame.pack(fill="x", pady=5)
+
+        df_insumos = self.db.listar_insumos()
+        insumos_names = df_insumos['nome'].tolist() if not df_insumos.empty else ["(nenhum insumo cadastrado)"]
+        insumos_id_map = {}
+        if not df_insumos.empty:
+            for _, r in df_insumos.iterrows():
+                insumos_id_map[r['nome']] = int(r['id'])
+
+        def _add_insumo_row():
+            row_f = ctk.CTkFrame(itens_frame, fg_color="transparent")
+            row_f.pack(fill="x", pady=2)
+            c_ins = ctk.CTkComboBox(row_f, values=insumos_names, state="readonly", width=250)
+            c_ins.pack(side="left", padx=(0, 5))
+            e_q = ctk.CTkEntry(row_f, placeholder_text="Qtd", width=80)
+            e_q.pack(side="left", padx=5)
+            btn_rm = ctk.CTkButton(row_f, text="✕", width=28, height=28, fg_color="#FF6B6B",
+                                   command=lambda: (_rm_row(row_f, item_data)))
+            btn_rm.pack(side="left", padx=5)
+            item_data = {'frame': row_f, 'combo': c_ins, 'qtd': e_q}
+            itens_ficha.append(item_data)
+
+        def _rm_row(frame, data):
+            frame.destroy()
+            if data in itens_ficha:
+                itens_ficha.remove(data)
+
+        _add_insumo_row()
+        ctk.CTkButton(main_frame, text="+ Adicionar Insumo", height=30, fg_color="#28a745",
+                      hover_color="#218838", text_color="white",
+                      command=_add_insumo_row).pack(pady=5)
+
+        def _salvar_ficha():
+            prod_nome = combo_prod.get()
+            if prod_nome not in prods_map:
+                messagebox.showerror("Erro", "Selecione o produto final.", parent=dialog)
+                return
+            nome_ficha = e_nome_ficha.get().strip()
+            if not nome_ficha:
+                messagebox.showerror("Erro", "Nome da ficha é obrigatório.", parent=dialog)
+                return
+            try:
+                rendimento = int(e_rendimento.get())
+                if rendimento <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Erro", "Rendimento deve ser um número inteiro positivo.", parent=dialog)
+                return
+
+            itens = []
+            for item in itens_ficha:
+                ins_nome = item['combo'].get()
+                if ins_nome not in insumos_id_map:
+                    continue
+                try:
+                    qtd = float(item['qtd'].get().replace(",", "."))
+                    if qtd <= 0:
+                        continue
+                except (ValueError, AttributeError):
+                    continue
+                itens.append({'insumo_id': insumos_id_map[ins_nome], 'quantidade': qtd})
+
+            if not itens:
+                messagebox.showerror("Erro", "Adicione ao menos um insumo à ficha.", parent=dialog)
+                return
+
+            self.db.adicionar_ficha_tecnica(prods_map[prod_nome], nome_ficha, rendimento, itens)
+            messagebox.showinfo("Sucesso", f"Ficha '{nome_ficha}' criada!", parent=dialog)
+            refresh_callback()
+            dialog.destroy()
+
+        ctk.CTkButton(main_frame, text="SALVAR FICHA TÉCNICA", command=_salvar_ficha,
+                      height=45, fg_color="#0A4174", hover_color="#062F56",
+                      font=("Aileron", 14, "bold")).pack(fill="x", pady=15)
+
+    # ==================== PRODUÇÃO DIÁRIA ====================
+
+    def open_producao_dialog(self):
+        """Dialog para registrar produção baseada em fichas técnicas."""
+        window = ctk.CTkToplevel(self)
+        window.title("Produção Diária")
+        window.geometry("700x550")
+        window.attributes("-topmost", True)
+
+        main_frame = ctk.CTkScrollableFrame(window, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(main_frame, text="Registrar Produção", font=("Aileron", 18, "bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 5))
+        ctk.CTkLabel(main_frame, text="Selecione uma ficha técnica e informe a quantidade produzida.\nOs insumos serão descontados automaticamente.",
+                    font=("Aileron", 10, "italic"), text_color="gray").pack(pady=(0, 10))
+
+        # Selecionar ficha técnica
+        prod_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        prod_card.pack(fill="x", pady=(0, 15))
+
+        df_fichas = self.db.listar_fichas_tecnicas()
+        fichas_map = {}
+        fichas_names = []
+        if not df_fichas.empty:
+            for _, r in df_fichas.iterrows():
+                display = f"{r['nome']} → {r['produto_nome']} (Rend: {r['rendimento']})"
+                fichas_names.append(display)
+                fichas_map[display] = int(r['id'])
+
+        ctk.CTkLabel(prod_card, text="Ficha Técnica:", font=("Aileron", 12, "bold")).pack(anchor="w", padx=15, pady=(10, 0))
+        combo_ficha = ctk.CTkComboBox(prod_card, values=fichas_names if fichas_names else ["(nenhuma ficha cadastrada)"], state="readonly")
+        combo_ficha.pack(fill="x", padx=15, pady=5)
+
+        # Mostrar insumos necessários
+        lbl_insumos_info = ctk.CTkLabel(prod_card, text="", font=("Aileron", 10), text_color="gray", justify="left")
+        lbl_insumos_info.pack(anchor="w", padx=15, pady=5)
+
+        def _on_ficha_change(val):
+            if val in fichas_map:
+                fid = fichas_map[val]
+                df_itens = self.db.get_ficha_tecnica_itens(fid)
+                if not df_itens.empty:
+                    linhas = []
+                    for _, it in df_itens.iterrows():
+                        un = it.get('unidade_medida', 'un') or 'un'
+                        linhas.append(f"  • {it['insumo_nome']}: {it['quantidade']} {un} (tem: {it['estoque_atual']})")
+                    lbl_insumos_info.configure(text="Insumos necessários (por lote):\n" + "\n".join(linhas))
+                else:
+                    lbl_insumos_info.configure(text="")
+
+        combo_ficha.configure(command=_on_ficha_change)
+
+        ctk.CTkLabel(prod_card, text="Quantidade a Produzir:", font=("Aileron", 12, "bold")).pack(anchor="w", padx=15, pady=(10, 0))
+        e_qtd_prod = ctk.CTkEntry(prod_card, placeholder_text="Ex: 50")
+        e_qtd_prod.pack(fill="x", padx=15, pady=5)
+
+        ctk.CTkLabel(prod_card, text="Observação:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        e_obs_prod = ctk.CTkEntry(prod_card, placeholder_text="(opcional)")
+        e_obs_prod.pack(fill="x", padx=15, pady=5)
+
+        def _registrar_producao():
+            sel = combo_ficha.get()
+            if sel not in fichas_map:
+                messagebox.showerror("Erro", "Selecione uma ficha técnica.", parent=window)
+                return
+            try:
+                qtd = int(e_qtd_prod.get())
+                if qtd <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Erro", "Quantidade inválida.", parent=window)
+                return
+            obs = e_obs_prod.get().strip()
+            ok, msg = self.db.registrar_producao(fichas_map[sel], qtd, obs)
+            if ok:
+                messagebox.showinfo("Sucesso", msg, parent=window)
+                e_qtd_prod.delete(0, "end")
+                _refresh_historico_prod()
+                self.refresh_dashboard()
+            else:
+                messagebox.showerror("Erro", msg, parent=window)
+
+        ctk.CTkButton(prod_card, text="PRODUZIR", command=_registrar_producao,
+                      height=45, fg_color="#28a745", hover_color="#218838",
+                      font=("Aileron", 14, "bold")).pack(fill="x", padx=15, pady=15)
+
+        # Histórico de produções
+        ctk.CTkLabel(main_frame, text="Histórico de Produções (últimos 30 dias):",
+                    font=("Aileron", 13, "bold"), text_color=("#001D39", "white")).pack(anchor="w", pady=(10, 5))
+        hist_prod_scroll = ctk.CTkScrollableFrame(main_frame, fg_color="transparent", height=150)
+        hist_prod_scroll.pack(fill="both", expand=True, pady=(0, 10))
+
+        def _refresh_historico_prod():
+            for w in hist_prod_scroll.winfo_children():
+                w.destroy()
+            df_prod = self.db.listar_producoes(30)
+            if df_prod.empty:
+                ctk.CTkLabel(hist_prod_scroll, text="Nenhuma produção registrada.", text_color="gray").pack(pady=10)
+                return
+            for _, r in df_prod.iterrows():
+                f = ctk.CTkFrame(hist_prod_scroll, fg_color=("white", "#3A3A3A"), corner_radius=8)
+                f.pack(fill="x", pady=2, padx=3)
+                txt = f"📦 {r['data']}  |  {r['ficha_nome']}  |  {r['quantidade_produzida']}un de {r['produto_nome']}"
+                if r.get('observacao'):
+                    txt += f"  |  {r['observacao']}"
+                ctk.CTkLabel(f, text=txt, font=("Aileron", 10), text_color=("#555", "#CCC"),
+                            anchor="w").pack(padx=10, pady=5, fill="x")
+        _refresh_historico_prod()
+
+    # ==================== TROCAS / DEVOLUÇÕES ====================
+
+    def open_trocas_dialog(self):
+        """Dialog para registrar trocas e devoluções (Loja de Roupas)."""
+        window = ctk.CTkToplevel(self)
+        window.title("Trocas e Devoluções")
+        window.geometry("800x600")
+        window.attributes("-topmost", True)
+
+        tabview = ctk.CTkTabview(window, fg_color="transparent")
+        tabview.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tab_nova = tabview.add("Nova Troca/Devolução")
+        tab_hist = tabview.add("Histórico")
+
+        # ===== ABA 1: NOVA TROCA =====
+        main_f = ctk.CTkScrollableFrame(tab_nova, fg_color="transparent")
+        main_f.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(main_f, text="Registrar Troca ou Devolução",
+                    font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=10)
+
+        card = ctk.CTkFrame(main_f, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        card.pack(fill="x", padx=10, pady=5)
+
+        df_prods = self.db.listar_produtos()
+        prods_names = df_prods['nome'].tolist() if not df_prods.empty else ["(nenhum)"]
+        prods_map = {}
+        if not df_prods.empty:
+            for _, r in df_prods.iterrows():
+                prods_map[r['nome']] = r
+
+        # Tipo
+        ctk.CTkLabel(card, text="Tipo:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(10, 0))
+        tipo_var = ctk.StringVar(value="troca")
+        tipo_frame = ctk.CTkFrame(card, fg_color="transparent")
+        tipo_frame.pack(fill="x", padx=15, pady=3)
+        ctk.CTkRadioButton(tipo_frame, text="Troca", variable=tipo_var, value="troca").pack(side="left", padx=10)
+        ctk.CTkRadioButton(tipo_frame, text="Devolução", variable=tipo_var, value="devolucao").pack(side="left", padx=10)
+
+        # Cliente
+        ctk.CTkLabel(card, text="Cliente:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        df_clientes = self.db.listar_clientes()
+        clientes_opt = ["Consumidor Final"] + (df_clientes['nome'].tolist() if not df_clientes.empty else [])
+        combo_cliente = ctk.CTkComboBox(card, values=clientes_opt)
+        combo_cliente.pack(fill="x", padx=15, pady=3)
+
+        # Produto devolvido
+        ctk.CTkLabel(card, text="Produto Devolvido:", font=("Aileron", 12, "bold"), text_color="#FF6B6B").pack(anchor="w", padx=15, pady=(10, 0))
+        combo_devolvido = ctk.CTkComboBox(card, values=prods_names, state="readonly")
+        combo_devolvido.pack(fill="x", padx=15, pady=3)
+        ctk.CTkLabel(card, text="Qtd Devolvida:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        e_qtd_dev = ctk.CTkEntry(card, placeholder_text="1")
+        e_qtd_dev.insert(0, "1")
+        e_qtd_dev.pack(fill="x", padx=15, pady=3)
+
+        # Produto novo (troca)
+        ctk.CTkLabel(card, text="Produto Novo (se troca):", font=("Aileron", 12, "bold"), text_color="#28a745").pack(anchor="w", padx=15, pady=(10, 0))
+        combo_novo = ctk.CTkComboBox(card, values=["(nenhum)"] + prods_names, state="readonly")
+        combo_novo.set("(nenhum)")
+        combo_novo.pack(fill="x", padx=15, pady=3)
+        ctk.CTkLabel(card, text="Qtd Nova:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        e_qtd_nova = ctk.CTkEntry(card, placeholder_text="1")
+        e_qtd_nova.insert(0, "1")
+        e_qtd_nova.pack(fill="x", padx=15, pady=3)
+
+        # Diferença de valor
+        ctk.CTkLabel(card, text="Diferença de Valor (R$):", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        ctk.CTkLabel(card, text="Positivo = cliente paga mais, Negativo = loja devolve", font=("Aileron", 9, "italic"), text_color="gray").pack(anchor="w", padx=15)
+        e_diferenca = ctk.CTkEntry(card, placeholder_text="0.00")
+        e_diferenca.insert(0, "0")
+        e_diferenca.pack(fill="x", padx=15, pady=3)
+
+        # Observação
+        ctk.CTkLabel(card, text="Observação:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        e_obs_troca = ctk.CTkEntry(card, placeholder_text="(opcional)")
+        e_obs_troca.pack(fill="x", padx=15, pady=3)
+
+        def _registrar_troca():
+            dev_nome = combo_devolvido.get()
+            if dev_nome not in prods_map:
+                messagebox.showerror("Erro", "Selecione o produto devolvido.", parent=window)
+                return
+            try:
+                qtd_dev = int(e_qtd_dev.get())
+                if qtd_dev <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Erro", "Quantidade devolvida inválida.", parent=window)
+                return
+
+            dev_id = int(prods_map[dev_nome]['id'])
+            tipo = tipo_var.get()
+            cliente = combo_cliente.get()
+
+            novo_id = None
+            qtd_nova = 0
+            novo_nome = combo_novo.get()
+            if tipo == "troca" and novo_nome != "(nenhum)" and novo_nome in prods_map:
+                novo_id = int(prods_map[novo_nome]['id'])
+                try:
+                    qtd_nova = int(e_qtd_nova.get())
+                except ValueError:
+                    qtd_nova = 1
+
+            try:
+                diferenca = float(e_diferenca.get().replace(",", "."))
+            except ValueError:
+                diferenca = 0.0
+
+            obs = e_obs_troca.get().strip()
+            ok, msg = self.db.registrar_troca(cliente, dev_id, qtd_dev, novo_id, qtd_nova, diferenca, tipo, obs)
+            if ok:
+                messagebox.showinfo("Sucesso", msg, parent=window)
+                _refresh_hist_trocas()
+                self.refresh_dashboard()
+            else:
+                messagebox.showerror("Erro", msg, parent=window)
+
+        ctk.CTkButton(card, text="CONFIRMAR", command=_registrar_troca,
+                      height=45, fg_color="#0A4174", hover_color="#062F56",
+                      font=("Aileron", 14, "bold")).pack(fill="x", padx=15, pady=15)
+
+        # ===== ABA 2: HISTÓRICO =====
+        hist_trocas_scroll = ctk.CTkScrollableFrame(tab_hist, fg_color="transparent")
+        hist_trocas_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+
+        def _refresh_hist_trocas():
+            for w in hist_trocas_scroll.winfo_children():
+                w.destroy()
+            df_t = self.db.listar_trocas(90)
+            if df_t.empty:
+                ctk.CTkLabel(hist_trocas_scroll, text="Nenhuma troca/devolução registrada.", text_color="gray").pack(pady=20)
+                return
+            for _, r in df_t.iterrows():
+                f = ctk.CTkFrame(hist_trocas_scroll, fg_color=("white", "#3A3A3A"), corner_radius=10,
+                                border_width=1, border_color=("#7BBDE8", "#49769F"))
+                f.pack(fill="x", pady=3, padx=5)
+                tipo_icon = "🔄" if r['tipo'] == 'troca' else "↩️"
+                txt = f"{tipo_icon} {r['data'][:10]}  |  {r['tipo'].title()}  |  {r['cliente']}\n"
+                txt += f"  Devolvido: {r['produto_devolvido_nome']} (x{r['qtd_devolvida']})"
+                if r.get('produto_novo_nome'):
+                    txt += f"  →  Novo: {r['produto_novo_nome']} (x{r['qtd_nova']})"
+                if r.get('diferenca_valor', 0) != 0:
+                    txt += f"  |  Diferença: R$ {r['diferenca_valor']:.2f}"
+                ctk.CTkLabel(f, text=txt, font=("Aileron", 10), text_color=("#555", "#CCC"),
+                            anchor="w", justify="left").pack(padx=15, pady=8, fill="x")
+        _refresh_hist_trocas()
+
+    # ==================== LISTA DE REPOSIÇÃO ====================
+
+    def open_lista_reposicao(self):
+        """Lista de produtos abaixo do estoque mínimo para reposição."""
+        window = ctk.CTkToplevel(self)
+        window.title("Lista de Reposição")
+        window.geometry("700x500")
+        window.attributes("-topmost", True)
+
+        ctk.CTkLabel(window, text="Lista de Reposição Automática",
+                    font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack(pady=15)
+        ctk.CTkLabel(window, text="Produtos abaixo do estoque mínimo configurado.",
+                    font=("Aileron", 10, "italic"), text_color="gray").pack()
+
+        lista_scroll = ctk.CTkScrollableFrame(window, fg_color="transparent")
+        lista_scroll.pack(fill="both", expand=True, padx=15, pady=10)
+
+        df_repor = self.db.gerar_lista_reposicao()
+        if df_repor.empty:
+            ctk.CTkLabel(lista_scroll, text="✅ Todos os produtos estão acima do estoque mínimo!",
+                        font=("Aileron", 14), text_color="#28a745").pack(pady=30)
+        else:
+            for _, r in df_repor.iterrows():
+                f = ctk.CTkFrame(lista_scroll, fg_color=("white", "#3A3A3A"), corner_radius=10,
+                                border_width=1, border_color=("#FF6B6B", "#CC5555"))
+                f.pack(fill="x", pady=3, padx=5)
+
+                urgencia = "🔴" if r['quantidade'] == 0 else "🟡"
+                txt = f"{urgencia}  {r['nome']}  |  Estoque: {r['quantidade']}  |  Mínimo: {r['estoque_minimo']}  |  Repor: {r['qtd_repor']}un"
+                if r.get('categoria'):
+                    txt += f"  |  {r['categoria']}"
+                ctk.CTkLabel(f, text=txt, font=("Aileron", 11), anchor="w",
+                            text_color=("#333", "white")).pack(padx=15, pady=10, fill="x")
+
+        # Botão exportar para texto (WhatsApp)
+        def _exportar_whatsapp():
+            if df_repor.empty:
+                messagebox.showinfo("Info", "Nenhum produto para repor.", parent=window)
+                return
+            linhas = ["📋 *Lista de Reposição*\n"]
+            for _, r in df_repor.iterrows():
+                linhas.append(f"• {r['nome']}: repor {r['qtd_repor']}un (atual: {r['quantidade']}, mín: {r['estoque_minimo']})")
+            texto = "\n".join(linhas)
+            # Copiar para clipboard
+            window.clipboard_clear()
+            window.clipboard_append(texto)
+            messagebox.showinfo("Copiado!", "Lista copiada para a área de transferência!\nCole no WhatsApp para enviar ao fornecedor.", parent=window)
+
+        btn_frame = ctk.CTkFrame(window, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=15, pady=10)
+        ctk.CTkButton(btn_frame, text="📋 Copiar para WhatsApp", command=_exportar_whatsapp,
+                      height=40, fg_color="#25D366", hover_color="#1DA851", text_color="white",
+                      font=("Aileron", 12, "bold")).pack(side="left", fill="x", expand=True, padx=5)
+        ctk.CTkButton(btn_frame, text="🔄 Atualizar", command=lambda: (window.destroy(), self.open_lista_reposicao()),
+                      height=40, fg_color="#7BBDE8", hover_color="#49769F", text_color="#001D39",
+                      font=("Aileron", 12, "bold")).pack(side="right", fill="x", expand=True, padx=5)
+
+    # ==================== ABERTURA / FECHAMENTO DE CAIXA ====================
+
+    def open_caixa_dialog(self):
+        """Dialog para abertura e fechamento de caixa com histórico."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Controle de Caixa")
+        dialog.geometry("750x550")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        tabview = ctk.CTkTabview(dialog, fg_color="transparent")
+        tabview.pack(padx=10, pady=10, fill="both", expand=True)
+
+        tab_caixa = tabview.add("Caixa")
+        tab_historico = tabview.add("Histórico")
+
+        # --- TAB CAIXA ---
+        caixa_aberto = self.db.caixa_aberto()
+        resumo_caixa = self.db.resumo_caixa_atual() if caixa_aberto else None
+
+        status_frame = ctk.CTkFrame(tab_caixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        status_frame.pack(fill="x", padx=10, pady=10)
+
+        if caixa_aberto:
+            ctk.CTkLabel(status_frame, text="CAIXA ABERTO", font=("Aileron", 18, "bold"),
+                        text_color="#28a745").pack(pady=(15, 5))
+            ctk.CTkLabel(status_frame, text=f"Aberto em: {caixa_aberto['data_abertura'][:16].replace('T', ' ')}",
+                        font=("Aileron", 12), text_color=("#555", "#CCC")).pack()
+            ctk.CTkLabel(status_frame, text=f"Valor inicial: R$ {caixa_aberto['valor_abertura']:.2f}",
+                        font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(5, 15))
+
+            # Fechar caixa
+            fechar_frame = ctk.CTkFrame(tab_caixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
+            fechar_frame.pack(fill="x", padx=10, pady=10)
+            ctk.CTkLabel(fechar_frame, text="Fechar Caixa", font=("Aileron", 14, "bold"),
+                        text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            ctk.CTkLabel(fechar_frame, text="Valor em caixa (contagem):", font=("Aileron", 11),
+                        text_color=("#001D39", "white")).pack(padx=15, anchor="w")
+            entry_fechamento = ctk.CTkEntry(fechar_frame, placeholder_text="R$ 0,00", width=200)
+            entry_fechamento.pack(padx=15, pady=5, anchor="w")
+            entry_fechamento.insert(0, f"{resumo_caixa['esperado_dinheiro']:.2f}" if resumo_caixa else "0.00")
+            ctk.CTkLabel(fechar_frame,
+                        text=f"Valor sugerido em caixa: R$ {resumo_caixa['esperado_dinheiro']:.2f}" if resumo_caixa else "Valor sugerido em caixa: R$ 0,00",
+                        font=("Aileron", 11), text_color=("#555", "#CCC")).pack(padx=15, anchor="w")
+            ctk.CTkLabel(fechar_frame, text="Observação:", font=("Aileron", 11),
+                        text_color=("#001D39", "white")).pack(padx=15, anchor="w")
+            entry_obs_fecha = ctk.CTkEntry(fechar_frame, placeholder_text="Opcional", width=400)
+            entry_obs_fecha.pack(padx=15, pady=5, anchor="w")
+
+            def _fechar_caixa():
+                try:
+                    valor = float(entry_fechamento.get().replace(",", "."))
+                except ValueError:
+                    messagebox.showerror("Erro", "Informe o valor em caixa.", parent=dialog)
+                    return
+                obs = entry_obs_fecha.get().strip()
+                ok, resultado = self.db.fechar_caixa(valor, obs)
+                if ok:
+                    resumo = (
+                        f"Caixa fechado!\n\n"
+                        f"Vendas no período: R$ {resultado['total_vendas']:.2f}\n"
+                        f"  Dinheiro: R$ {resultado['total_dinheiro']:.2f}\n"
+                        f"  PIX: R$ {resultado['total_pix']:.2f}\n"
+                        f"  Cartão: R$ {resultado['total_cartao']:.2f}\n\n"
+                        f"Abertura: R$ {resultado['valor_abertura']:.2f}\n"
+                        f"Esperado em caixa: R$ {resultado['esperado']:.2f}\n"
+                        f"Informado: R$ {resultado['informado']:.2f}\n"
+                        f"Diferença: R$ {resultado['diferenca']:.2f}"
+                    )
+                    messagebox.showinfo("Caixa Fechado", resumo, parent=dialog)
+                    dialog.grab_release()
+                    dialog.destroy()
+                    # Pequeno delay para garantir que o diálogo anterior foi destruído
+                    self.after(200, self.open_caixa_dialog)
+                else:
+                    messagebox.showerror("Erro", resultado, parent=dialog)
+
+            ctk.CTkButton(fechar_frame, text="FECHAR CAIXA", command=_fechar_caixa, height=40,
+                         fg_color="#FF6B6B", hover_color="#FF5252", text_color="white",
+                         font=("Aileron", 13, "bold")).pack(padx=15, pady=15, fill="x")
+        else:
+            ctk.CTkLabel(status_frame, text="CAIXA FECHADO", font=("Aileron", 18, "bold"),
+                        text_color="#FF6B6B").pack(pady=(15, 5))
+            ctk.CTkLabel(status_frame, text="Abra o caixa para iniciar as operações do dia.",
+                        font=("Aileron", 12), text_color=("#555", "#CCC")).pack(pady=(0, 15))
+
+            abrir_frame = ctk.CTkFrame(tab_caixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
+            abrir_frame.pack(fill="x", padx=10, pady=10)
+            ctk.CTkLabel(abrir_frame, text="Abrir Caixa", font=("Aileron", 14, "bold"),
+                        text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
+            ctk.CTkLabel(abrir_frame, text="Valor inicial (troco):", font=("Aileron", 11),
+                        text_color=("#001D39", "white")).pack(padx=15, anchor="w")
+            entry_abertura = ctk.CTkEntry(abrir_frame, placeholder_text="R$ 0,00", width=200)
+            entry_abertura.pack(padx=15, pady=5, anchor="w")
+            ctk.CTkLabel(abrir_frame, text="Observação:", font=("Aileron", 11),
+                        text_color=("#001D39", "white")).pack(padx=15, anchor="w")
+            entry_obs_abre = ctk.CTkEntry(abrir_frame, placeholder_text="Opcional", width=400)
+            entry_obs_abre.pack(padx=15, pady=5, anchor="w")
+
+            def _abrir_caixa():
+                try:
+                    valor = float(entry_abertura.get().replace(",", "."))
+                except ValueError:
+                    valor = 0.0
+                obs = entry_obs_abre.get().strip()
+                ok, msg = self.db.abrir_caixa(valor, obs)
+                if ok:
+                    messagebox.showinfo("Sucesso", msg, parent=dialog)
+                    dialog.grab_release()
+                    dialog.destroy()
+                    # Pequeno delay para garantir que o diálogo anterior foi destruído
+                    self.after(200, self.open_caixa_dialog)
+                else:
+                    messagebox.showerror("Erro", msg, parent=dialog)
+
+            ctk.CTkButton(abrir_frame, text="ABRIR CAIXA", command=_abrir_caixa, height=40,
+                         fg_color="#28a745", hover_color="#218838", text_color="white",
+                         font=("Aileron", 13, "bold")).pack(padx=15, pady=15, fill="x")
+
+        # --- TAB HISTÓRICO ---
+        df_hist = self.db.historico_caixa(60)
+        if df_hist.empty:
+            ctk.CTkLabel(tab_historico, text="Nenhum registro de caixa encontrado.",
+                        font=("Aileron", 12), text_color=("#555", "#CCC")).pack(pady=30)
+        else:
+            hist_scroll = ctk.CTkScrollableFrame(tab_historico, fg_color="transparent")
+            hist_scroll.pack(fill="both", expand=True, padx=5, pady=5)
+            for _, row in df_hist.iterrows():
+                card = ctk.CTkFrame(hist_scroll, fg_color=("white", "#2B2B2B"), corner_radius=10)
+                card.pack(fill="x", padx=5, pady=3)
+                data_ab = str(row.get('data_abertura', ''))[:16].replace('T', ' ')
+                data_fe = str(row.get('data_fechamento', ''))[:16].replace('T', ' ')
+                dif = row.get('diferenca', 0) or 0
+                cor_dif = "#28a745" if dif >= 0 else "#FF6B6B"
+                ctk.CTkLabel(card, text=f"{data_ab}  →  {data_fe}",
+                            font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).pack(anchor="w", padx=10, pady=(5, 0))
+                ctk.CTkLabel(card, text=f"Vendas: R$ {row.get('total_vendas', 0):.2f} | Dinheiro: R$ {row.get('total_dinheiro', 0):.2f} | PIX: R$ {row.get('total_pix', 0):.2f} | Cartão: R$ {row.get('total_cartao', 0):.2f}",
+                            font=("Aileron", 10), text_color=("#555", "#CCC")).pack(anchor="w", padx=10)
+                ctk.CTkLabel(card, text=f"Diferença: R$ {dif:.2f}",
+                            font=("Aileron", 11, "bold"), text_color=cor_dif).pack(anchor="w", padx=10, pady=(0, 5))
+
+    # ==================== VENDEDORES / FUNCIONÁRIOS ====================
+
+    def open_vendedores_dialog(self):
+        """Dialog para gerenciar vendedores/funcionários com desempenho."""
+        window = ctk.CTkToplevel(self)
+        window.title("Vendedores / Funcionários")
+        window.geometry("850x600")
+        window.attributes("-topmost", True)
+
+        tabview = ctk.CTkTabview(window, fg_color="transparent")
+        tabview.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tab_lista = tabview.add("Equipe")
+        tab_desempenho = tabview.add("Desempenho")
+
+        # ===== ABA EQUIPE =====
+        add_frame = ctk.CTkFrame(tab_lista, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        add_frame.pack(fill="x", padx=10, pady=(5, 10))
+        ctk.CTkLabel(add_frame, text="Adicionar Vendedor", font=("Aileron", 13, "bold"),
+                    text_color=("#001D39", "white")).pack(anchor="w", padx=15, pady=(10, 5))
+
+        fields_f = ctk.CTkFrame(add_frame, fg_color="transparent")
+        fields_f.pack(fill="x", padx=15, pady=5)
+
+        ctk.CTkLabel(fields_f, text="Nome:", font=("Aileron", 11)).pack(side="left", padx=(0, 5))
+        e_nome = ctk.CTkEntry(fields_f, width=150, placeholder_text="Nome do vendedor")
+        e_nome.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(fields_f, text="Entrada:", font=("Aileron", 11)).pack(side="left", padx=(0, 3))
+        e_h_ini = ctk.CTkEntry(fields_f, width=60, placeholder_text="08:00")
+        e_h_ini.insert(0, "08:00")
+        e_h_ini.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(fields_f, text="Saída:", font=("Aileron", 11)).pack(side="left", padx=(0, 3))
+        e_h_fim = ctk.CTkEntry(fields_f, width=60, placeholder_text="18:00")
+        e_h_fim.insert(0, "18:00")
+        e_h_fim.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(fields_f, text="Comissão %:", font=("Aileron", 11)).pack(side="left", padx=(0, 3))
+        e_comissao = ctk.CTkEntry(fields_f, width=50, placeholder_text="0")
+        e_comissao.insert(0, "0")
+        e_comissao.pack(side="left", padx=(0, 10))
+
+        list_frame = ctk.CTkFrame(tab_lista, fg_color="transparent")
+        list_frame.pack(fill="both", expand=True, padx=10)
+
+        from tkinter import ttk as ttk_local
+        cols = ("id", "nome", "horario", "comissao")
+        tree_v = ttk_local.Treeview(list_frame, columns=cols, show="headings", height=12)
+        for c, h, w in [("id", "ID", 40), ("nome", "Nome", 200), ("horario", "Horário", 150), ("comissao", "Comissão %", 80)]:
+            tree_v.heading(c, text=h)
+            tree_v.column(c, width=w, anchor="center" if c != "nome" else "w")
+        tree_v.pack(side="left", fill="both", expand=True)
+        ttk_local.Scrollbar(list_frame, orient="vertical", command=tree_v.yview).pack(side="right", fill="y")
+
+        # Indicador de turno atual
+        turno_atual = self.db.vendedor_no_turno()
+        if turno_atual:
+            ctk.CTkLabel(tab_lista, text=f"\U0001f7e2 No turno agora: {turno_atual}",
+                        font=("Aileron", 12, "bold"), text_color="#28a745").pack(pady=(5, 0))
+
+        def _refresh():
+            for i in tree_v.get_children():
+                tree_v.delete(i)
+            df = self.db.listar_vendedores()
+            for _, r in df.iterrows():
+                tree_v.insert("", "end", values=(
+                    r['id'], r['nome'],
+                    f"{r['horario_inicio']} - {r['horario_fim']}",
+                    f"{r.get('comissao', 0):.1f}%"
+                ))
+        _refresh()
+
+        def _add():
+            nome = e_nome.get().strip()
+            if not nome:
+                messagebox.showerror("Erro", "Informe o nome.", parent=window)
+                return
+            h_ini = e_h_ini.get().strip() or "08:00"
+            h_fim = e_h_fim.get().strip() or "18:00"
+            try:
+                com = float(e_comissao.get().replace(",", ".")) if e_comissao.get().strip() else 0
+            except ValueError:
+                com = 0
+            self.db.adicionar_vendedor(nome, h_ini, h_fim, com)
+            e_nome.delete(0, "end")
+            _refresh()
+
+        def _remove():
+            sel = tree_v.selection()
+            if not sel:
+                return
+            vid = tree_v.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirmar", "Desativar este vendedor?", parent=window):
+                self.db.remover_vendedor(vid)
+                _refresh()
+
+        btn_f = ctk.CTkFrame(tab_lista, fg_color="transparent")
+        btn_f.pack(fill="x", padx=10, pady=5)
+        ctk.CTkButton(add_frame, text="Adicionar", command=_add, height=32,
+                     fg_color="#0A4174", hover_color="#062F56").pack(padx=15, pady=(0, 10), fill="x")
+        ctk.CTkButton(btn_f, text="Desativar Selecionado", command=_remove, height=30,
+                     fg_color="#FF6B6B", hover_color="#FF5252", text_color="white").pack(side="right")
+
+        # ===== ABA DESEMPENHO =====
+        ctk.CTkLabel(tab_desempenho, text="Desempenho dos Vendedores (30 dias)",
+                    font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(10, 5))
+
+        df_perf = self.db.vendas_por_vendedor(30)
+        if df_perf.empty:
+            ctk.CTkLabel(tab_desempenho, text="Nenhuma venda com vendedor identificado nos últimos 30 dias.",
+                        font=("Aileron", 12), text_color=("#555", "#CCC")).pack(pady=20)
+        else:
+            perf_scroll = ctk.CTkScrollableFrame(tab_desempenho, fg_color="transparent")
+            perf_scroll.pack(fill="both", expand=True, padx=10, pady=5)
+
+            # Calcular comissões
+            df_vendedores = self.db.listar_vendedores()
+            comissao_map = {}
+            if not df_vendedores.empty:
+                comissao_map = dict(zip(df_vendedores['nome'], df_vendedores['comissao']))
+
+            for _, r in df_perf.iterrows():
+                card = ctk.CTkFrame(perf_scroll, fg_color=("white", "#2B2B2B"), corner_radius=10)
+                card.pack(fill="x", padx=5, pady=3)
+                nome_v = r['vendedor']
+                vendas_n = int(r['num_vendas'])
+                total_v = r['total_vendido'] or 0
+                lucro_v = r['total_lucro'] or 0
+                pct_comissao = comissao_map.get(nome_v, 0) or 0
+                valor_comissao = total_v * (pct_comissao / 100)
+
+                ctk.CTkLabel(card, text=nome_v, font=("Aileron", 13, "bold"),
+                            text_color=("#001D39", "white")).pack(anchor="w", padx=10, pady=(5, 0))
+                info = f"{vendas_n} vendas | Faturamento: R$ {total_v:.2f} | Lucro: R$ {lucro_v:.2f}"
+                if pct_comissao > 0:
+                    info += f" | Comissão ({pct_comissao:.0f}%): R$ {valor_comissao:.2f}"
+                ctk.CTkLabel(card, text=info, font=("Aileron", 10),
+                            text_color=("#555", "#CCC")).pack(anchor="w", padx=10, pady=(0, 5))
+
+    # ==================== NOTA DE SERVIÇO ====================
+
+    def open_servico_dialog(self):
+        """Dialog para registrar serviço e gerar nota (custo visível só pro vendedor)."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Nota de Serviço")
+        dialog.geometry("800x600")
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+
+        tabview = ctk.CTkTabview(dialog, fg_color="transparent")
+        tabview.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tab_novo = tabview.add("Novo Serviço")
+        tab_hist = tabview.add("Histórico")
+
+        # ===== ABA 1: NOVO SERVIÇO =====
+        main_f = ctk.CTkScrollableFrame(tab_novo, fg_color="transparent")
+        main_f.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(main_f, text="Registrar Serviço", font=("Aileron", 18, "bold"),
+                    text_color=("#001D39", "white")).pack(pady=(5, 10))
+
+        card = ctk.CTkFrame(main_f, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        card.pack(fill="x", padx=10, pady=5)
+
+        # Cliente
+        ctk.CTkLabel(card, text="Cliente:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(10, 0))
+        df_clientes = self.db.listar_clientes()
+        clientes_opt = ["Consumidor Final"] + (df_clientes['nome'].tolist() if not df_clientes.empty else [])
+        combo_cliente = ctk.CTkComboBox(card, values=clientes_opt)
+        combo_cliente.pack(fill="x", padx=15, pady=3)
+
+        ctk.CTkLabel(card, text="Contato (WhatsApp):", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        e_contato = ctk.CTkEntry(card, placeholder_text="(00) 00000-0000")
+        e_contato.pack(fill="x", padx=15, pady=3)
+
+        def _on_cliente_change(val):
+            if val != "Consumidor Final" and not df_clientes.empty:
+                row = df_clientes[df_clientes['nome'] == val]
+                if not row.empty:
+                    contato = row.iloc[0].get('contato', '') or ''
+                    e_contato.delete(0, "end")
+                    e_contato.insert(0, contato)
+        combo_cliente.configure(command=_on_cliente_change)
+
+        # Descrição do serviço
+        ctk.CTkLabel(card, text="Serviço Realizado:", font=("Aileron", 12, "bold"),
+                    text_color="#0A4174").pack(anchor="w", padx=15, pady=(10, 0))
+        e_descricao = ctk.CTkTextbox(card, height=80, font=("Aileron", 11),
+                                     fg_color=("#F5F5F5", "#333333"), corner_radius=8)
+        e_descricao.pack(fill="x", padx=15, pady=3)
+
+        # Valor cobrado
+        ctk.CTkLabel(card, text="Valor Cobrado (R$):", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(10, 0))
+        e_valor = ctk.CTkEntry(card, placeholder_text="Ex: 150.00")
+        e_valor.pack(fill="x", padx=15, pady=3)
+
+        # Custo (peças, material) — VISÍVEL SOMENTE NO SISTEMA
+        custo_frame = ctk.CTkFrame(card, fg_color=("#FFF8E1", "#3A3520"), corner_radius=10,
+                                   border_width=1, border_color=("#FFD54F", "#8D6E00"))
+        custo_frame.pack(fill="x", padx=15, pady=(10, 0))
+        ctk.CTkLabel(custo_frame, text="🔒 Custo Interno (não aparece na nota do cliente)",
+                    font=("Aileron", 10, "italic"), text_color=("#8D6E00", "#FFD54F")).pack(anchor="w", padx=10, pady=(5, 0))
+        ctk.CTkLabel(custo_frame, text="Custo (peças, material, etc.):", font=("Aileron", 11, "bold")).pack(anchor="w", padx=10, pady=(3, 0))
+        e_custo = ctk.CTkEntry(custo_frame, placeholder_text="Ex: 45.00 (opcional)")
+        e_custo.pack(fill="x", padx=10, pady=(3, 8))
+
+        # Forma de pagamento
+        ctk.CTkLabel(card, text="Forma de Pagamento:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(10, 0))
+        formas = ["Dinheiro", "PIX", "Cartão Débito", "Cartão Crédito", "Transferência", "Fiado"]
+        combo_forma = ctk.CTkComboBox(card, values=formas, state="readonly")
+        combo_forma.set("Dinheiro")
+        combo_forma.pack(fill="x", padx=15, pady=3)
+
+        # Observação
+        ctk.CTkLabel(card, text="Observação:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        e_obs = ctk.CTkEntry(card, placeholder_text="(opcional)")
+        e_obs.pack(fill="x", padx=15, pady=3)
+
+        # Equipamento / Item (rastreabilidade)
+        os_cfg = self._get_os_config()
+        ctk.CTkLabel(card, text=os_cfg["equip_label"], font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        e_equip = ctk.CTkEntry(card, placeholder_text=os_cfg["equip_placeholder"])
+        e_equip.pack(fill="x", padx=15, pady=3)
+
+        # Status OS
+        status_os_options = os_cfg["statuses"]
+        ctk.CTkLabel(card, text="Status da OS:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        combo_status_os = ctk.CTkComboBox(card, values=status_os_options, state="readonly")
+        combo_status_os.set("Concluído")
+        combo_status_os.pack(fill="x", padx=15, pady=3)
+
+        # Vendedor
+        ctk.CTkLabel(card, text="Vendedor/Atendente:", font=("Aileron", 11, "bold")).pack(anchor="w", padx=15, pady=(5, 0))
+        df_vend_serv = self.db.listar_vendedores()
+        vend_opts_serv = [""] + (df_vend_serv['nome'].tolist() if not df_vend_serv.empty else [])
+        combo_vendedor_serv = ctk.CTkComboBox(card, values=vend_opts_serv)
+        combo_vendedor_serv.set(self.db.vendedor_no_turno())
+        combo_vendedor_serv.pack(fill="x", padx=15, pady=3)
+
+        # Lucro estimado em tempo real
+        lbl_lucro = ctk.CTkLabel(card, text="", font=("Aileron", 11, "bold"), text_color="#28a745")
+        lbl_lucro.pack(anchor="w", padx=15, pady=(5, 0))
+
+        def _atualizar_lucro(*_):
+            try:
+                valor = float(e_valor.get().replace(",", ".")) if e_valor.get().strip() else 0
+                custo = float(e_custo.get().replace(",", ".")) if e_custo.get().strip() else 0
+                lucro = valor - custo
+                cor = "#28a745" if lucro >= 0 else "#FF6B6B"
+                lbl_lucro.configure(text=f"Lucro estimado: R$ {lucro:.2f}", text_color=cor)
+            except ValueError:
+                lbl_lucro.configure(text="")
+        e_valor.bind("<KeyRelease>", _atualizar_lucro)
+        e_custo.bind("<KeyRelease>", _atualizar_lucro)
+
+        def _registrar_servico():
+            descricao = e_descricao.get("1.0", "end-1c").strip()
+            if not descricao:
+                messagebox.showerror("Erro", "Descreva o serviço realizado.", parent=dialog)
+                return
+            try:
+                valor = float(e_valor.get().replace(",", "."))
+                if valor <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Erro", "Valor inválido.", parent=dialog)
+                return
+            try:
+                custo = float(e_custo.get().replace(",", ".")) if e_custo.get().strip() else 0
+            except ValueError:
+                custo = 0
+
+            cliente = combo_cliente.get()
+            forma = combo_forma.get()
+            obs = e_obs.get().strip()
+            contato = e_contato.get().strip()
+            vendedor_serv = combo_vendedor_serv.get().strip()
+            equipamento = e_equip.get().strip()
+            status_os = combo_status_os.get()
+
+            ok, result = self.db.registrar_servico(cliente, descricao, valor, custo, forma, obs, vendedor=vendedor_serv,
+                                                    status_os=status_os, contato_cliente=contato, equipamento=equipamento)
+            if not ok:
+                messagebox.showerror("Erro", f"Erro ao registrar: {result}", parent=dialog)
+                return
+
+            servico_id = result
+
+            # Gerar nota de serviço (SEM custo — custo é interno)
+            try:
+                config_nota = self.db.get_config_nota()
+                dados_cliente = {"nome": cliente}
+                if contato:
+                    dados_cliente["contato"] = contato
+
+                file_path, text_content, wpp_content = invoice_generator.gerar_nota_servico(
+                    descricao, valor, dados_cliente, id_servico=servico_id,
+                    forma_pagamento=forma, observacao=obs,
+                    abrir_arquivo=False, config_nota=config_nota
+                )
+
+                if file_path and text_content:
+                    resp = messagebox.askyesno("Imprimir Nota",
+                        f"Serviço #{servico_id} registrado!\nValor: R$ {valor:.2f}\n\nDeseja imprimir a nota?",
+                        parent=dialog)
+                    if resp:
+                        try:
+                            printer = get_printer()
+                            logo_path = None
+                            logo_file = config_nota.get('empresa_logo', '')
+                            if logo_file:
+                                logo_path = os.path.join(self.db.data_dir, "product_images", logo_file)
+                                if not os.path.isfile(logo_path):
+                                    logo_path = None
+                            printer.print_text(text_content, logo_path=logo_path)
+                            messagebox.showinfo("Sucesso", "Nota enviada para impressão!", parent=dialog)
+                        except Exception as e:
+                            logger.warning("Erro ao imprimir nota de serviço: %s", e)
+                            messagebox.showwarning("Aviso",
+                                f"Não foi possível imprimir.\nNota salva em:\n{file_path}", parent=dialog)
+                            try:
+                                if os.name == 'nt':
+                                    os.startfile(file_path)
+                            except Exception:
+                                pass
+
+                    # WhatsApp
+                    if contato:
+                        enviar_wpp = messagebox.askyesno("Enviar por WhatsApp",
+                            f"Enviar nota por WhatsApp para {contato}?", parent=dialog)
+                        if enviar_wpp:
+                            try:
+                                from printer import enviar_whatsapp
+                                sucesso = enviar_whatsapp(contato, wpp_content or text_content)
+                                if sucesso:
+                                    messagebox.showinfo("WhatsApp",
+                                        "WhatsApp Web será aberto com a nota.\nClique em 'Enviar' no navegador.", parent=dialog)
+                                else:
+                                    messagebox.showwarning("WhatsApp",
+                                        "Não foi possível abrir o WhatsApp.", parent=dialog)
+                            except Exception as e:
+                                logger.warning("Erro WhatsApp serviço: %s", e)
+                else:
+                    messagebox.showinfo("Sucesso", f"Serviço #{servico_id} registrado com sucesso!", parent=dialog)
+            except Exception as e:
+                logger.warning("Erro ao gerar nota de serviço: %s", e)
+                messagebox.showinfo("Sucesso", f"Serviço #{servico_id} registrado!\n(Nota não gerada)", parent=dialog)
+
+            # Limpar campos
+            e_descricao.delete("1.0", "end")
+            e_valor.delete(0, "end")
+            e_custo.delete(0, "end")
+            e_obs.delete(0, "end")
+            e_equip.delete(0, "end")
+            combo_status_os.set("Concluído")
+            lbl_lucro.configure(text="")
+            _refresh_hist()
+            self.refresh_dashboard()
+
+        ctk.CTkButton(card, text="REGISTRAR SERVIÇO E GERAR NOTA", command=_registrar_servico,
+                      height=45, fg_color="#0A4174", hover_color="#062F56",
+                      font=("Aileron", 14, "bold")).pack(fill="x", padx=15, pady=15)
+
+        # ===== ABA 2: HISTÓRICO =====
+        hist_filter_frame = ctk.CTkFrame(tab_hist, fg_color="transparent")
+        hist_filter_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        ctk.CTkLabel(hist_filter_frame, text="🔍", font=ctk.CTkFont(size=14)).pack(side="left", padx=(0, 5))
+
+        hist_search_var = ctk.StringVar()
+        hist_search = ctk.CTkEntry(hist_filter_frame, placeholder_text="Buscar por ID, cliente...",
+                                   textvariable=hist_search_var, height=34, width=180, corner_radius=20)
+        hist_search.pack(side="left", padx=(0, 8))
+
+        ctk.CTkLabel(hist_filter_frame, text="De:", font=ctk.CTkFont(family="Aileron", size=11),
+                     text_color=("#555", "#AAA")).pack(side="left", padx=(5, 2))
+        hist_date_from = ctk.CTkEntry(hist_filter_frame, placeholder_text="DD/MM/AAAA",
+                                      height=34, width=110, corner_radius=10)
+        hist_date_from.pack(side="left", padx=(0, 5))
+
+        ctk.CTkLabel(hist_filter_frame, text="Até:", font=ctk.CTkFont(family="Aileron", size=11),
+                     text_color=("#555", "#AAA")).pack(side="left", padx=(5, 2))
+        hist_date_to = ctk.CTkEntry(hist_filter_frame, placeholder_text="DD/MM/AAAA",
+                                    height=34, width=110, corner_radius=10)
+        hist_date_to.pack(side="left", padx=(0, 5))
+
+        hist_status_var = ctk.StringVar(value="Todos")
+        hist_status_combo = ctk.CTkComboBox(hist_filter_frame, variable=hist_status_var,
+                                            values=["Todos"] + os_cfg["statuses"],
+                                            width=130, height=34, state="readonly",
+                                            font=ctk.CTkFont(family="Aileron", size=10),
+                                            command=lambda _: _refresh_hist())
+        hist_status_combo.pack(side="left", padx=(5, 0))
+
+        _hist_timer = {"id": None}
+
+        hist_scroll = ctk.CTkScrollableFrame(tab_hist, fg_color="transparent")
+        hist_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        status_colors = os_cfg["colors"]
+        status_os_all = os_cfg["statuses"]
+
+        def _parse_date(txt):
+            """Converte DD/MM/AAAA ou AAAA-MM-DD para date."""
+            txt = txt.strip()
+            if not txt:
+                return None
+            try:
+                if "/" in txt:
+                    parts = txt.split("/")
+                    return datetime.date(int(parts[2]), int(parts[1]), int(parts[0]))
+                return datetime.date.fromisoformat(txt)
+            except (ValueError, IndexError):
+                return None
+
+        def _refresh_hist():
+            for w in hist_scroll.winfo_children():
+                w.destroy()
+            df_s = self.db.listar_servicos(365)
+            if df_s.empty:
+                ctk.CTkLabel(hist_scroll, text="Nenhum serviço registrado.", text_color="gray").pack(pady=20)
+                return
+
+            search_txt = hist_search_var.get().strip().lower()
+            date_from = _parse_date(hist_date_from.get())
+            date_to = _parse_date(hist_date_to.get())
+            status_filter = hist_status_var.get()
+
+            filtered = df_s.copy()
+
+            # Filtro por busca (ID ou cliente)
+            if search_txt:
+                mask = filtered['id'].astype(str).str.contains(search_txt, na=False, regex=False)
+                mask = mask | filtered['cliente'].astype(str).str.lower().str.contains(search_txt, na=False, regex=False)
+                if 'descricao' in filtered.columns:
+                    mask = mask | filtered['descricao'].astype(str).str.lower().str.contains(search_txt, na=False, regex=False)
+                if 'equipamento' in filtered.columns:
+                    mask = mask | filtered['equipamento'].astype(str).str.lower().str.contains(search_txt, na=False, regex=False)
+                filtered = filtered[mask]
+
+            # Filtro por data
+            if date_from or date_to:
+                def _to_date(val):
+                    try:
+                        return datetime.date.fromisoformat(str(val)[:10])
+                    except (ValueError, TypeError):
+                        return None
+                filtered['_dt'] = filtered['data'].apply(_to_date)
+                if date_from:
+                    filtered = filtered[filtered['_dt'].apply(lambda d: d is not None and d >= date_from)]
+                if date_to:
+                    filtered = filtered[filtered['_dt'].apply(lambda d: d is not None and d <= date_to)]
+                filtered = filtered.drop(columns=['_dt'])
+
+            # Filtro por status
+            if status_filter != "Todos":
+                st_col = filtered.get('status_os', pd.Series(dtype=str))
+                filtered = filtered[st_col == status_filter]
+
+            if filtered.empty:
+                ctk.CTkLabel(hist_scroll, text="Nenhum serviço encontrado com esses filtros.",
+                             text_color="gray").pack(pady=20)
+                return
+
+            for _, r in filtered.iterrows():
+                sid = r['id']
+                st = r.get('status_os', r.get('status', 'Concluído')) or 'Concluído'
+                equip = r.get('equipamento', '') or ''
+                cor_st = status_colors.get(st, "#888")
+
+                f = ctk.CTkFrame(hist_scroll, fg_color=("white", "#3A3A3A"), corner_radius=10,
+                                border_width=1, border_color=(cor_st, cor_st))
+                f.pack(fill="x", pady=3, padx=5)
+
+                data_str = str(r['data'])[:10] if r.get('data') else ''
+                custo_v = r.get('custo', 0) or 0
+                valor_v = r.get('valor', 0)
+                lucro_v = valor_v - custo_v
+
+                # Primeira linha: data, cliente, descrição
+                top_f = ctk.CTkFrame(f, fg_color="transparent")
+                top_f.pack(fill="x", padx=10, pady=(6, 0))
+
+                ctk.CTkLabel(top_f, text=f"🔧 #{sid}  |  {data_str}  |  {r['cliente']}",
+                            font=("Aileron", 10, "bold"), text_color=("#333", "#DDD")).pack(side="left")
+                # Badge de status
+                ctk.CTkLabel(top_f, text=f"  {st}  ", font=("Aileron", 10, "bold"),
+                            text_color="white", fg_color=cor_st, corner_radius=5).pack(side="right")
+
+                # Segunda linha: detalhes
+                desc_txt = r['descricao'][:50]
+                if equip:
+                    desc_txt = f"[{equip}] {desc_txt}"
+                detail = f" {desc_txt}  |  R$ {valor_v:.2f}"
+                if custo_v > 0:
+                    detail += f"  |  Lucro: R$ {lucro_v:.2f}"
+                detail += f"  |  {r.get('forma_pagamento', '')}"
+
+                ctk.CTkLabel(f, text=detail, font=("Aileron", 10), text_color=("#555", "#CCC"),
+                            anchor="w", justify="left").pack(padx=15, pady=(0, 2), fill="x")
+
+                # Botão alterar status (se não concluído/entregue)
+                if st not in ("Concluído", "Entregue"):
+                    btn_f = ctk.CTkFrame(f, fg_color="transparent")
+                    btn_f.pack(fill="x", padx=15, pady=(0, 6))
+                    def _change_status(s_id=sid, current=st):
+                        idx = status_os_all.index(current) if current in status_os_all else 0
+                        next_st = status_os_all[min(idx + 1, len(status_os_all) - 1)]
+                        self.db.atualizar_status_servico(s_id, next_st)
+                        _refresh_hist()
+                    ctk.CTkButton(btn_f, text=f"Avançar Status →", height=24, font=("Aileron", 10),
+                                  fg_color=cor_st, hover_color="#333", text_color="white",
+                                  command=_change_status).pack(side="left")
+
+        def _on_hist_search(*_a):
+            if _hist_timer["id"]:
+                dialog.after_cancel(_hist_timer["id"])
+            _hist_timer["id"] = dialog.after(400, _refresh_hist)
+
+        hist_search_var.trace_add("write", _on_hist_search)
+        hist_date_from.bind("<KeyRelease>", _on_hist_search)
+        hist_date_to.bind("<KeyRelease>", _on_hist_search)
+
+        _refresh_hist()
+
+    # ==================== RESTAURANTE - GESTÃO DE MESAS ====================
+
+    def open_mesas_manager(self):
+        """Gerencia mesas do restaurante com mapa visual."""
+        window = ctk.CTkToplevel(self)
+        window.title("Gestão de Mesas")
+        window.geometry("850x650")
+        window.attributes("-topmost", True)
+
+        main_frame = ctk.CTkFrame(window, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        # Header
+        header = ctk.CTkFrame(main_frame, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(header, text="🍽️ Mapa de Mesas", font=("Aileron", 20, "bold"),
+                     text_color=("#001D39", "white")).pack(side="left")
+
+        # Adicionar mesas
+        add_f = ctk.CTkFrame(header, fg_color="transparent")
+        add_f.pack(side="right")
+        ctk.CTkLabel(add_f, text="Qtd:", font=("Aileron", 11)).pack(side="left", padx=3)
+        e_qtd = ctk.CTkEntry(add_f, width=50, placeholder_text="5")
+        e_qtd.pack(side="left", padx=3)
+        ctk.CTkLabel(add_f, text="Lugares:", font=("Aileron", 11)).pack(side="left", padx=3)
+        e_cap = ctk.CTkEntry(add_f, width=40, placeholder_text="4")
+        e_cap.pack(side="left", padx=3)
+        ctk.CTkLabel(add_f, text="Área:", font=("Aileron", 11)).pack(side="left", padx=3)
+        combo_area = ctk.CTkComboBox(add_f, values=["Salão", "Varanda", "Área Externa", "VIP", "Balcão"],
+                                      width=110, state="readonly")
+        combo_area.set("Salão")
+        combo_area.pack(side="left", padx=3)
+
+        def _add_mesas():
+            try:
+                qtd = int(e_qtd.get())
+            except ValueError:
+                qtd = 1
+            try:
+                cap = int(e_cap.get())
+            except ValueError:
+                cap = 4
+            area = combo_area.get()
+            criadas = self.db.criar_mesas(qtd, cap, area)
+            messagebox.showinfo("Sucesso", f"{criadas} mesa(s) criada(s).", parent=window)
+            _refresh()
+
+        ctk.CTkButton(add_f, text="+ Criar", width=80, height=30, fg_color="#E07B56",
+                      hover_color="#C4623E", text_color="white", font=("Aileron", 11, "bold"),
+                      command=_add_mesas).pack(side="left", padx=5)
+
+        # Legenda
+        leg = ctk.CTkFrame(main_frame, fg_color="transparent")
+        leg.pack(fill="x", pady=(0, 5))
+        for cor, txt in [("#28a745", "Livre"), ("#FF6B6B", "Ocupada"), ("#FFD93D", "Reservada")]:
+            ctk.CTkLabel(leg, text=f"● {txt}", font=("Aileron", 10, "bold"), text_color=cor).pack(side="left", padx=10)
+
+        # Grid de mesas
+        mesas_scroll = ctk.CTkScrollableFrame(main_frame, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        mesas_scroll.pack(fill="both", expand=True)
+
+        def _refresh():
+            for w in mesas_scroll.winfo_children():
+                w.destroy()
+            df = self.db.listar_mesas()
+            if df.empty:
+                ctk.CTkLabel(mesas_scroll, text="Nenhuma mesa cadastrada.\nUse o botão '+ Criar' acima.",
+                             font=("Aileron", 13), text_color="gray").pack(pady=40)
+                return
+
+            # Agrupar por área
+            for area_nome in df['area'].unique():
+                area_label = ctk.CTkLabel(mesas_scroll, text=f"📍 {area_nome}",
+                                          font=("Aileron", 13, "bold"), text_color=("#001D39", "white"))
+                area_label.pack(anchor="w", padx=10, pady=(10, 3))
+
+                area_frame = ctk.CTkFrame(mesas_scroll, fg_color="transparent")
+                area_frame.pack(fill="x", padx=10, pady=(0, 5))
+
+                area_mesas = df[df['area'] == area_nome]
+                col = 0
+                for _, mesa in area_mesas.iterrows():
+                    status = mesa['status']
+                    cores = {"livre": "#28a745", "ocupada": "#FF6B6B", "reservada": "#FFD93D"}
+                    cor = cores.get(status, "#888")
+                    text_cor = "white" if status != "reservada" else "#333"
+
+                    card = ctk.CTkFrame(area_frame, width=120, height=100, fg_color=cor,
+                                        corner_radius=15)
+                    card.grid(row=0, column=col, padx=6, pady=6)
+                    card.grid_propagate(False)
+
+                    inner = ctk.CTkFrame(card, fg_color="transparent")
+                    inner.place(relx=0.5, rely=0.5, anchor="center")
+
+                    ctk.CTkLabel(inner, text=f"Mesa {mesa['numero']}", font=("Aileron", 13, "bold"),
+                                 text_color=text_cor).pack()
+                    ctk.CTkLabel(inner, text=f"{mesa['capacidade']} lug.", font=("Aileron", 9),
+                                 text_color=text_cor).pack()
+                    ctk.CTkLabel(inner, text=status.upper(), font=("Aileron", 9, "bold"),
+                                 text_color=text_cor).pack()
+
+                    # Botões de ação
+                    btn_frame = ctk.CTkFrame(inner, fg_color="transparent")
+                    btn_frame.pack(pady=(3, 0))
+
+                    if status == "livre":
+                        ctk.CTkButton(btn_frame, text="Abrir", width=50, height=22, font=("Aileron", 9),
+                                      fg_color="white", text_color="#28a745", hover_color="#e0e0e0",
+                                      command=lambda m=mesa: self._abrir_comanda_mesa(m, window)).pack(side="left", padx=1)
+                    elif status == "ocupada":
+                        ctk.CTkButton(btn_frame, text="Ver", width=50, height=22, font=("Aileron", 9),
+                                      fg_color="white", text_color="#FF6B6B", hover_color="#e0e0e0",
+                                      command=lambda m=mesa: self._ver_comanda_mesa(m, window)).pack(side="left", padx=1)
+
+                    def _del_mesa(mid=mesa['id']):
+                        if messagebox.askyesno("Confirmar", "Remover esta mesa?", parent=window):
+                            self.db.remover_mesa(mid)
+                            _refresh()
+                    ctk.CTkButton(btn_frame, text="✕", width=22, height=22, font=("Aileron", 9),
+                                  fg_color="white", text_color="red", hover_color="#e0e0e0",
+                                  command=_del_mesa).pack(side="left", padx=1)
+
+                    col += 1
+
+        self._refresh_mesas = _refresh
+        _refresh()
+
+    def _abrir_comanda_mesa(self, mesa, parent_window=None):
+        """Abre uma comanda para a mesa selecionada e abre o dialog de comanda."""
+        comanda_id = self.db.abrir_comanda(mesa_id=mesa['id'], tipo_atendimento="mesa")
+        if parent_window and hasattr(self, '_refresh_mesas'):
+            self._refresh_mesas()
+        self._open_comanda_editor(comanda_id)
+
+    def _ver_comanda_mesa(self, mesa, parent_window=None):
+        """Abre a comanda existente da mesa."""
+        comanda = self.db.get_comanda_por_mesa(mesa['id'])
+        if comanda:
+            self._open_comanda_editor(comanda['id'])
+        else:
+            messagebox.showinfo("Info", "Nenhuma comanda aberta nesta mesa.", parent=parent_window or self)
+
+    # ==================== RESTAURANTE - COMANDAS ====================
+
+    def open_comandas_dialog(self):
+        """Dialog principal de comandas — lista abertas e permite criar nova."""
+        window = ctk.CTkToplevel(self)
+        window.title("Comandas")
+        window.geometry("900x650")
+        window.attributes("-topmost", True)
+
+        main_frame = ctk.CTkFrame(window, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        # Header + Nova comanda
+        header = ctk.CTkFrame(main_frame, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(header, text="📋 Comandas", font=("Aileron", 20, "bold"),
+                     text_color=("#001D39", "white")).pack(side="left")
+
+        # Botões de nova comanda
+        new_btn_frame = ctk.CTkFrame(header, fg_color="transparent")
+        new_btn_frame.pack(side="right")
+
+        for tipo, icon, cor in [("Balcão", "🪑", "#6EA2B3"), ("Delivery", "🛵", "#E07B56"), ("Retirada", "📦", "#85C1E9")]:
+            ctk.CTkButton(new_btn_frame, text=f"{icon} {tipo}", width=100, height=30,
+                          fg_color=cor, hover_color="#49769F", text_color="white",
+                          font=("Aileron", 10, "bold"),
+                          command=lambda t=tipo.lower(): self._nova_comanda_sem_mesa(t, window, _refresh)).pack(side="left", padx=3)
+
+        # Tabs
+        tabview = ctk.CTkTabview(main_frame, fg_color="transparent")
+        tabview.pack(fill="both", expand=True)
+        tab_abertas = tabview.add("Abertas")
+        tab_historico = tabview.add("Histórico")
+
+        # === Abertas ===
+        scroll_abertas = ctk.CTkScrollableFrame(tab_abertas, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        scroll_abertas.pack(fill="both", expand=True)
+
+        def _refresh():
+            for w in scroll_abertas.winfo_children():
+                w.destroy()
+            df = self.db.listar_comandas_abertas()
+            if df.empty:
+                ctk.CTkLabel(scroll_abertas, text="Nenhuma comanda aberta.", font=("Aileron", 13),
+                             text_color="gray").pack(pady=30)
+                return
+            for _, c in df.iterrows():
+                card = ctk.CTkFrame(scroll_abertas, fg_color=("white", "#2B2B2B"), corner_radius=12)
+                card.pack(fill="x", padx=5, pady=4)
+
+                info = ctk.CTkFrame(card, fg_color="transparent")
+                info.pack(side="left", fill="x", expand=True, padx=12, pady=10)
+
+                tipo_icons = {"mesa": "🍽️", "balcão": "🪑", "delivery": "🛵", "retirada": "📦"}
+                tipo_icon = tipo_icons.get(c['tipo_atendimento'], "📋")
+                mesa_txt = f" — Mesa {int(c['mesa_numero'])}" if pd.notna(c.get('mesa_numero')) else ""
+                ctk.CTkLabel(info, text=f"{tipo_icon} Comanda #{c['id']}{mesa_txt}",
+                             font=("Aileron", 13, "bold"), text_color=("#001D39", "white")).pack(anchor="w")
+                hora = str(c['data_abertura'])[:16].replace('T', ' ')
+                ctk.CTkLabel(info, text=f"Cliente: {c['cliente']} | Aberta: {hora} | Garçom: {c.get('garcom', '')}",
+                             font=("Aileron", 10), text_color=("#555", "#CCC")).pack(anchor="w")
+                ctk.CTkLabel(info, text=f"Total: R$ {c['total']:.2f}",
+                             font=("Aileron", 12, "bold"), text_color="#E07B56").pack(anchor="w")
+
+                btns = ctk.CTkFrame(card, fg_color="transparent")
+                btns.pack(side="right", padx=10, pady=10)
+                ctk.CTkButton(btns, text="Editar", width=65, height=28, fg_color="#7BBDE8",
+                              text_color="#001D39", hover_color="#49769F",
+                              font=("Aileron", 10, "bold"),
+                              command=lambda cid=c['id']: [self._open_comanda_editor(cid), window.after(300, _refresh)]).pack(pady=2)
+                ctk.CTkButton(btns, text="Fechar", width=65, height=28, fg_color="#28a745",
+                              text_color="white", hover_color="#218838",
+                              font=("Aileron", 10, "bold"),
+                              command=lambda cid=c['id']: [self._fechar_comanda_dialog(cid), window.after(500, _refresh)]).pack(pady=2)
+
+        _refresh()
+
+        # === Histórico ===
+        scroll_hist = ctk.CTkScrollableFrame(tab_historico, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        scroll_hist.pack(fill="both", expand=True)
+
+        df_hist = self.db.listar_comandas_historico(30)
+        if df_hist.empty:
+            ctk.CTkLabel(scroll_hist, text="Nenhum registro.", font=("Aileron", 12), text_color="gray").pack(pady=30)
+        else:
+            for _, c in df_hist.iterrows():
+                card = ctk.CTkFrame(scroll_hist, fg_color=("white", "#2B2B2B"), corner_radius=10)
+                card.pack(fill="x", padx=5, pady=3)
+                status_cor = "#28a745" if c['status'] == 'fechada' else ("#FFD93D" if c['status'] == 'aberta' else "#FF6B6B")
+                mesa_txt = f" Mesa {int(c['mesa_numero'])}" if pd.notna(c.get('mesa_numero')) else f" {c['tipo_atendimento']}"
+                dt_txt = str(c['data_abertura'])[:16].replace('T', ' ')
+                ctk.CTkLabel(card, text=f"#{c['id']} |{mesa_txt} | {dt_txt} | {c['cliente']} | R$ {c['total']:.2f}",
+                             font=("Aileron", 11), text_color=("#333", "#CCC")).pack(anchor="w", padx=12, pady=6)
+                ctk.CTkLabel(card, text=c['status'].upper(), font=("Aileron", 9, "bold"),
+                             text_color=status_cor).pack(anchor="e", padx=12, pady=(0, 5))
+
+    def _nova_comanda_sem_mesa(self, tipo, parent_window, refresh_callback):
+        """Cria comanda sem mesa (balcão/delivery/retirada)."""
+        comanda_id = self.db.abrir_comanda(mesa_id=None, tipo_atendimento=tipo)
+        self._open_comanda_editor(comanda_id)
+        parent_window.after(300, refresh_callback)
+
+    def _open_comanda_editor(self, comanda_id):
+        """Editor de comanda — adicionar itens, observações, ver total."""
+        comanda = self.db.get_comanda(comanda_id)
+        if not comanda or comanda['status'] != 'aberta':
+            messagebox.showinfo("Info", "Comanda não encontrada ou já fechada.")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Comanda #{comanda_id}")
+        dialog.geometry("950x700")
+        dialog.attributes("-topmost", True)
+
+        main = ctk.CTkFrame(dialog, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(1, weight=1)
+
+        # Header
+        tipo_icons = {"mesa": "🍽️", "balcão": "🪑", "delivery": "🛵", "retirada": "📦"}
+        tipo_icon = tipo_icons.get(comanda['tipo_atendimento'], "📋")
+        mesa_txt = ""
+        if comanda['mesa_id']:
+            df_mesas = self.db.listar_mesas()
+            mesa_row = df_mesas[df_mesas['id'] == comanda['mesa_id']]
+            if not mesa_row.empty:
+                mesa_txt = f" — Mesa {mesa_row.iloc[0]['numero']}"
+
+        ctk.CTkLabel(main, text=f"{tipo_icon} Comanda #{comanda_id}{mesa_txt}",
+                     font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
+
+        # ======= ESQUERDA: Cardápio =======
+        left = ctk.CTkFrame(main, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        left.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+        left.grid_rowconfigure(2, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(left, text="Cardápio", font=("Aileron", 14, "bold"),
+                     text_color=("#001D39", "white")).grid(row=0, column=0, padx=15, pady=(10, 5), sticky="w")
+
+        # Busca
+        search_frame = ctk.CTkFrame(left, fg_color="transparent")
+        search_frame.grid(row=1, column=0, sticky="ew", padx=15, pady=(0, 5))
+        entry_busca = ctk.CTkEntry(search_frame, placeholder_text="🔍 Buscar item...", height=30)
+        entry_busca.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        # Filtro de categorias
+        df_prods = self.db.listar_produtos_vendaveis()
+        cats = ["Todos"]
+        if not df_prods.empty and 'categoria' in df_prods.columns:
+            cats += sorted(df_prods['categoria'].dropna().unique().tolist())
+        var_cat = ctk.StringVar(value="Todos")
+        combo_cat = ctk.CTkComboBox(search_frame, values=cats, variable=var_cat,
+                                     width=120, state="readonly", height=28, font=("Aileron", 10))
+        combo_cat.pack(side="right")
+
+        # Lista de produtos
+        prod_scroll = ctk.CTkScrollableFrame(left, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        prod_scroll.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        def _render_produtos(filtro="", cat="Todos"):
+            for w in prod_scroll.winfo_children():
+                w.destroy()
+            if df_prods.empty:
+                ctk.CTkLabel(prod_scroll, text="Nenhum produto cadastrado.", text_color="gray").pack(pady=20)
+                return
+            for _, p in df_prods.iterrows():
+                nome = str(p['nome'])
+                if filtro and filtro.lower() not in nome.lower():
+                    continue
+                if cat != "Todos" and str(p.get('categoria', '')) != cat:
+                    continue
+
+                item_f = ctk.CTkFrame(prod_scroll, fg_color=("white", "#404040"), corner_radius=8)
+                item_f.pack(fill="x", padx=3, pady=2)
+
+                ctk.CTkLabel(item_f, text=nome, font=("Aileron", 11, "bold"),
+                             text_color=("#001D39", "white")).pack(side="left", padx=10, pady=6)
+                ctk.CTkLabel(item_f, text=f"R$ {p['preco']:.2f}", font=("Aileron", 11),
+                             text_color="#E07B56").pack(side="left", padx=5)
+                ctk.CTkLabel(item_f, text=f"Est: {p['quantidade']}", font=("Aileron", 9),
+                             text_color=("#888", "#AAA")).pack(side="left", padx=5)
+
+                # Frame para qtd + obs + botão
+                action_f = ctk.CTkFrame(item_f, fg_color="transparent")
+                action_f.pack(side="right", padx=5, pady=3)
+
+                e_obs = ctk.CTkEntry(action_f, placeholder_text="Obs...", width=80, height=24, font=("Aileron", 9))
+                e_obs.pack(side="left", padx=2)
+                e_qtd = ctk.CTkEntry(action_f, width=35, height=24, font=("Aileron", 10))
+                e_qtd.insert(0, "1")
+                e_qtd.pack(side="left", padx=2)
+
+                def _add_item(prod=p, eq=e_qtd, eo=e_obs):
+                    try:
+                        qtd = int(eq.get())
+                    except ValueError:
+                        qtd = 1
+                    obs = eo.get().strip()
+                    self.db.adicionar_item_comanda(comanda_id, prod['id'], prod['nome'], qtd, prod['preco'], obs)
+                    _refresh_comanda()
+
+                ctk.CTkButton(action_f, text="+", width=28, height=24, fg_color="#E07B56",
+                              hover_color="#C4623E", text_color="white", font=("Aileron", 12, "bold"),
+                              command=_add_item).pack(side="left", padx=2)
+
+        def _on_search(*_):
+            _render_produtos(entry_busca.get(), var_cat.get())
+        entry_busca.bind("<KeyRelease>", _on_search)
+        var_cat.trace_add("write", _on_search)
+        _render_produtos()
+
+        # ======= DIREITA: Itens da Comanda =======
+        right = ctk.CTkFrame(main, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        right.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(right, text="Itens do Pedido", font=("Aileron", 14, "bold"),
+                     text_color=("#001D39", "white")).grid(row=0, column=0, padx=15, pady=(10, 5), sticky="w")
+
+        itens_scroll = ctk.CTkScrollableFrame(right, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
+        itens_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 5))
+
+        # Rodapé: total + ações
+        footer = ctk.CTkFrame(right, fg_color="transparent")
+        footer.grid(row=2, column=0, sticky="ew", padx=15, pady=(5, 10))
+
+        lbl_total = ctk.CTkLabel(footer, text="Total: R$ 0,00", font=("Aileron", 16, "bold"),
+                                  text_color="#E07B56")
+        lbl_total.pack(anchor="w")
+
+        btns_footer = ctk.CTkFrame(footer, fg_color="transparent")
+        btns_footer.pack(fill="x", pady=(5, 0))
+
+        ctk.CTkButton(btns_footer, text="💵 Fechar Comanda", height=36, fg_color="#28a745",
+                      hover_color="#218838", text_color="white", font=("Aileron", 12, "bold"),
+                      command=lambda: [self._fechar_comanda_dialog(comanda_id), dialog.destroy()]).pack(side="left", padx=3)
+        ctk.CTkButton(btns_footer, text="÷ Dividir", height=36, fg_color="#6EA2B3",
+                      hover_color="#49769F", text_color="white", font=("Aileron", 12, "bold"),
+                      command=lambda: self._dividir_conta_dialog(comanda_id)).pack(side="left", padx=3)
+
+        status_cores = {"Recebido": "#FFD93D", "Preparando": "#E07B56", "Pronto": "#28a745", "Entregue": "#7BBDE8"}
+
+        def _refresh_comanda():
+            for w in itens_scroll.winfo_children():
+                w.destroy()
+            df_itens = self.db.listar_itens_comanda(comanda_id)
+            comanda_atualizada = self.db.get_comanda(comanda_id)
+            total = comanda_atualizada['total'] if comanda_atualizada else 0
+            lbl_total.configure(text=f"Total: R$ {total:.2f}")
+
+            if df_itens.empty:
+                ctk.CTkLabel(itens_scroll, text="Nenhum item adicionado.", text_color="gray").pack(pady=20)
+                return
+
+            for _, item in df_itens.iterrows():
+                item_card = ctk.CTkFrame(itens_scroll, fg_color=("white", "#404040"), corner_radius=8)
+                item_card.pack(fill="x", padx=3, pady=2)
+
+                # Info
+                info_f = ctk.CTkFrame(item_card, fg_color="transparent")
+                info_f.pack(side="left", fill="x", expand=True, padx=8, pady=6)
+
+                ctk.CTkLabel(info_f, text=f"{item['quantidade']}x {item['produto_nome']}",
+                             font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).pack(anchor="w")
+                sub = item['quantidade'] * item['preco_unitario']
+                ctk.CTkLabel(info_f, text=f"R$ {sub:.2f}", font=("Aileron", 10),
+                             text_color="#E07B56").pack(anchor="w")
+                if item['observacao']:
+                    ctk.CTkLabel(info_f, text=f"📝 {item['observacao']}", font=("Aileron", 9),
+                                 text_color=("#888", "#AAA")).pack(anchor="w")
+
+                # Status + Ações
+                act_f = ctk.CTkFrame(item_card, fg_color="transparent")
+                act_f.pack(side="right", padx=8, pady=4)
+
+                status_cor = status_cores.get(item['status'], "#888")
+                ctk.CTkLabel(act_f, text=item['status'], font=("Aileron", 9, "bold"),
+                             text_color=status_cor).pack()
+
+                # Avançar status
+                status_flow = ["Recebido", "Preparando", "Pronto", "Entregue"]
+                idx = status_flow.index(item['status']) if item['status'] in status_flow else -1
+                if idx < len(status_flow) - 1:
+                    next_status = status_flow[idx + 1]
+                    ctk.CTkButton(act_f, text=f"→ {next_status}", width=70, height=20,
+                                  font=("Aileron", 8), fg_color=status_cores.get(next_status, "#888"),
+                                  text_color="white", hover_color="#49769F",
+                                  command=lambda iid=item['id'], ns=next_status: [
+                                      self.db.atualizar_status_item_comanda(iid, ns), _refresh_comanda()]).pack(pady=1)
+
+                ctk.CTkButton(act_f, text="✕", width=25, height=20, fg_color="#FF6B6B",
+                              text_color="white", hover_color="#FF5252", font=("Aileron", 9),
+                              command=lambda iid=item['id']: [
+                                  self.db.remover_item_comanda(iid), _refresh_comanda()]).pack(pady=1)
+
+        _refresh_comanda()
+
+    def _fechar_comanda_dialog(self, comanda_id):
+        """Dialog para fechar comanda com forma de pagamento, taxa e desconto."""
+        comanda = self.db.get_comanda(comanda_id)
+        if not comanda or comanda['status'] != 'aberta':
+            messagebox.showinfo("Info", "Comanda não encontrada ou já fechada.")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Fechar Comanda #{comanda_id}")
+        dialog.geometry("450x500")
+        dialog.attributes("-topmost", True)
+
+        frame = ctk.CTkFrame(dialog, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(frame, text=f"Fechar Comanda #{comanda_id}", font=("Aileron", 16, "bold"),
+                     text_color=("#001D39", "white")).pack(pady=(15, 10))
+
+        subtotal = comanda['total']
+        ctk.CTkLabel(frame, text=f"Subtotal: R$ {subtotal:.2f}", font=("Aileron", 14),
+                     text_color=("#001D39", "white")).pack(pady=5)
+
+        # Taxa de serviço (10%)
+        taxa_10 = round(subtotal * 0.10, 2)
+        var_taxa = ctk.BooleanVar(value=False)
+        chk_taxa = ctk.CTkCheckBox(frame, text=f"Taxa de serviço 10% (R$ {taxa_10:.2f})",
+                                     variable=var_taxa, font=("Aileron", 12))
+        chk_taxa.pack(padx=20, pady=5, anchor="w")
+
+        # Desconto
+        ctk.CTkLabel(frame, text="Desconto (R$):", font=("Aileron", 11)).pack(padx=20, anchor="w", pady=(10, 2))
+        e_desc = ctk.CTkEntry(frame, placeholder_text="0,00", width=150)
+        e_desc.pack(padx=20, anchor="w")
+
+        # Forma de pagamento
+        ctk.CTkLabel(frame, text="Forma de Pagamento:", font=("Aileron", 11)).pack(padx=20, anchor="w", pady=(10, 2))
+        var_pgto = ctk.StringVar(value="Dinheiro")
+        combo_pgto = ctk.CTkComboBox(frame, values=["Dinheiro", "PIX", "Cartão Débito", "Cartão Crédito", "Misto"],
+                                      variable=var_pgto, width=200, state="readonly")
+        combo_pgto.pack(padx=20, anchor="w")
+
+        # Observação
+        ctk.CTkLabel(frame, text="Observação:", font=("Aileron", 11)).pack(padx=20, anchor="w", pady=(10, 2))
+        e_obs = ctk.CTkEntry(frame, placeholder_text="Opcional", width=300)
+        e_obs.pack(padx=20, anchor="w")
+
+        # Total final dinâmico
+        lbl_final = ctk.CTkLabel(frame, text=f"Total: R$ {subtotal:.2f}",
+                                  font=("Aileron", 18, "bold"), text_color="#28a745")
+        lbl_final.pack(pady=15)
+
+        def _recalc(*_):
+            taxa = taxa_10 if var_taxa.get() else 0
+            try:
+                desc = float(e_desc.get().replace(",", "."))
+            except ValueError:
+                desc = 0
+            total_f = subtotal + taxa - desc
+            lbl_final.configure(text=f"Total: R$ {max(total_f, 0):.2f}")
+
+        var_taxa.trace_add("write", _recalc)
+        e_desc.bind("<KeyRelease>", _recalc)
+
+        def _confirmar():
+            taxa = taxa_10 if var_taxa.get() else 0
+            try:
+                desc = float(e_desc.get().replace(",", "."))
+            except ValueError:
+                desc = 0
+            pgto = var_pgto.get()
+            obs = e_obs.get().strip()
+            ok, msg = self.db.fechar_comanda(comanda_id, pgto, taxa, desc, obs)
+            if ok:
+                messagebox.showinfo("Sucesso", msg, parent=dialog)
+                dialog.destroy()
+                if hasattr(self, '_refresh_mesas'):
+                    self._refresh_mesas()
+            else:
+                messagebox.showerror("Erro", msg, parent=dialog)
+
+        ctk.CTkButton(frame, text="CONFIRMAR FECHAMENTO", height=40, fg_color="#28a745",
+                      hover_color="#218838", text_color="white", font=("Aileron", 13, "bold"),
+                      command=_confirmar).pack(fill="x", padx=20, pady=(5, 15))
+
+    def _dividir_conta_dialog(self, comanda_id):
+        """Dialog para dividir a conta."""
+        comanda = self.db.get_comanda(comanda_id)
+        if not comanda:
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Dividir Conta")
+        dialog.geometry("350x300")
+        dialog.attributes("-topmost", True)
+
+        frame = ctk.CTkFrame(dialog, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(frame, text="÷ Dividir Conta", font=("Aileron", 16, "bold"),
+                     text_color=("#001D39", "white")).pack(pady=(15, 10))
+
+        total = comanda['total']
+        ctk.CTkLabel(frame, text=f"Total: R$ {total:.2f}", font=("Aileron", 14),
+                     text_color="#E07B56").pack(pady=5)
+
+        ctk.CTkLabel(frame, text="Número de pessoas:", font=("Aileron", 12)).pack(pady=(10, 3))
+        e_pessoas = ctk.CTkEntry(frame, width=80, font=("Aileron", 14))
+        e_pessoas.insert(0, "2")
+        e_pessoas.pack()
+
+        lbl_result = ctk.CTkLabel(frame, text="", font=("Aileron", 18, "bold"), text_color="#28a745")
+        lbl_result.pack(pady=15)
+
+        def _calc(*_):
+            try:
+                n = int(e_pessoas.get())
+                if n < 1:
+                    n = 1
+            except ValueError:
+                n = 1
+            resultado = self.db.dividir_conta(comanda_id, n)
+            if resultado:
+                lbl_result.configure(text=f"R$ {resultado['valor_por_pessoa']:.2f} por pessoa")
+
+        e_pessoas.bind("<KeyRelease>", _calc)
+        _calc()
+
+    # ==================== RESTAURANTE - COZINHA ====================
+
+    def open_cozinha_dialog(self):
+        """Painel da cozinha — mostra pedidos pendentes para preparar."""
+        window = ctk.CTkToplevel(self)
+        window.title("🍳 Painel da Cozinha")
+        window.geometry("900x600")
+        window.attributes("-topmost", True)
+
+        main_frame = ctk.CTkFrame(window, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        header = ctk.CTkFrame(main_frame, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(header, text="🍳 Painel da Cozinha", font=("Aileron", 20, "bold"),
+                     text_color=("#001D39", "white")).pack(side="left")
+        ctk.CTkButton(header, text="🔄 Atualizar", width=100, height=30, fg_color="#E07B56",
+                      hover_color="#C4623E", text_color="white", font=("Aileron", 11, "bold"),
+                      command=lambda: _refresh()).pack(side="right")
+
+        # Colunas: Recebido | Preparando | Pronto
+        cols_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        cols_frame.pack(fill="both", expand=True)
+        cols_frame.grid_columnconfigure(0, weight=1)
+        cols_frame.grid_columnconfigure(1, weight=1)
+        cols_frame.grid_columnconfigure(2, weight=1)
+        cols_frame.grid_rowconfigure(1, weight=1)
+
+        status_config = [
+            ("Recebido", "#FFD93D", "Preparando"),
+            ("Preparando", "#E07B56", "Pronto"),
+            ("Pronto", "#28a745", "Entregue"),
+        ]
+
+        col_scrolls = {}
+        for i, (status, cor, next_st) in enumerate(status_config):
+            ctk.CTkLabel(cols_frame, text=f"● {status.upper()}", font=("Aileron", 14, "bold"),
+                         text_color=cor).grid(row=0, column=i, padx=5, pady=(0, 5))
+            scroll = ctk.CTkScrollableFrame(cols_frame, fg_color=("#F0F0F0", "#2B2B2B"), corner_radius=10)
+            scroll.grid(row=1, column=i, sticky="nsew", padx=5)
+            col_scrolls[status] = scroll
+
+        def _refresh():
+            for scroll in col_scrolls.values():
+                for w in scroll.winfo_children():
+                    w.destroy()
+
+            df = self.db.itens_cozinha_pendentes()
+            if df.empty:
+                ctk.CTkLabel(col_scrolls["Recebido"], text="Nenhum pedido pendente! 🎉",
+                             font=("Aileron", 12), text_color="gray").pack(pady=30)
+                return
+
+            for _, item in df.iterrows():
+                status = item['status']
+                if status not in col_scrolls:
+                    continue
+                scroll = col_scrolls[status]
+
+                card = ctk.CTkFrame(scroll, fg_color=("white", "#404040"), corner_radius=10)
+                card.pack(fill="x", padx=5, pady=4)
+
+                mesa_txt = f"Mesa {int(item['mesa_numero'])}" if pd.notna(item.get('mesa_numero')) else item['tipo_atendimento'].capitalize()
+                ctk.CTkLabel(card, text=f"📍 {mesa_txt}", font=("Aileron", 9, "bold"),
+                             text_color=("#888", "#AAA")).pack(anchor="w", padx=10, pady=(6, 0))
+                ctk.CTkLabel(card, text=f"{item['quantidade']}x {item['produto_nome']}",
+                             font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(anchor="w", padx=10)
+                if item['observacao']:
+                    ctk.CTkLabel(card, text=f"📝 {item['observacao']}", font=("Aileron", 9),
+                                 text_color="#E07B56").pack(anchor="w", padx=10)
+
+                hora = str(item['data_hora'])[11:16]
+                ctk.CTkLabel(card, text=f"⏰ {hora}", font=("Aileron", 9), text_color=("#888", "#AAA")).pack(anchor="w", padx=10)
+
+                # Botão avançar
+                next_map = {"Recebido": "Preparando", "Preparando": "Pronto", "Pronto": "Entregue"}
+                next_st = next_map.get(status)
+                if next_st:
+                    cor_btn = {"Preparando": "#E07B56", "Pronto": "#28a745", "Entregue": "#7BBDE8"}.get(next_st, "#888")
+                    ctk.CTkButton(card, text=f"→ {next_st}", height=26, fg_color=cor_btn,
+                                  text_color="white", hover_color="#49769F", font=("Aileron", 10, "bold"),
+                                  command=lambda iid=item['id'], ns=next_st: [
+                                      self.db.atualizar_status_item_comanda(iid, ns), _refresh()]).pack(
+                        fill="x", padx=10, pady=(3, 8))
+
+        _refresh()
+        # Auto-refresh a cada 15 segundos
+        def _auto_refresh():
+            try:
+                if window.winfo_exists():
+                    _refresh()
+                    window.after(15000, _auto_refresh)
+            except Exception:
+                pass
+        window.after(15000, _auto_refresh)
+
+    # ================================================================
+    # ============ NOVAS FUNCIONALIDADES ============
+    # ================================================================
+
+    # --- Dashboard Auto-Refresh ---
+    def _start_auto_refresh(self):
+        """Atualiza o dashboard automaticamente a cada 60 segundos."""
+        def _tick():
+            try:
+                if self.winfo_exists():
+                    self.refresh_dashboard()
+                    self.after(60000, _tick)
+            except Exception:
+                pass
+        self.after(60000, _tick)
+
+    # --- Notificações Toast na Inicialização ---
+    def _exibir_alertas_iniciais(self):
+        """Exibe notificações toast para alertas pendentes (exceto estoque baixo, que vira tarefa)."""
+        try:
+            # Criar tarefas automáticas para estoque baixo (sem popup)
+            count = self.db.criar_tarefas_estoque_baixo()
+            if count > 0:
+                self.refresh_metas_list()
+                self.notifier.notify(
+                    "Estoque Baixo",
+                    f"{count} tarefa(s) de reposição criada(s) automaticamente.",
+                    tipo="info",
+                    duracao=5000
+                )
+            # Demais alertas (validade, fiados etc.) continuam como toast
+            alertas = self.db.coletar_alertas()
+            for alerta in alertas:
+                if alerta["tipo"] == "estoque_baixo":
+                    continue  # Já tratado como tarefa
+                tipo_toast = "error" if alerta["prioridade"] == "alta" else "warning"
+                self.notifier.notify(
+                    alerta["titulo"],
+                    alerta["mensagem"],
+                    tipo=tipo_toast,
+                    duracao=8000
+                )
+        except Exception as e:
+            logger.debug("Erro ao exibir alertas iniciais: %s", e)
+
+    # --- Iniciar API REST ---
+    def _iniciar_api_server(self):
+        """Inicia o servidor REST API para comunicação com o app mobile."""
+        try:
+            import api_server
+            if api_server.api_disponivel():
+                self.api_server = api_server.EstokeAPI(self.db, port=5050)
+                self.api_server.start()
+                logger.info("API REST iniciada na porta 5050")
+        except Exception as e:
+            logger.debug("API REST não disponível: %s", e)
+
+    # ================================================================
+    # ============ CONTAS A PAGAR ============
+    # ================================================================
+
+    def open_contas_pagar_dialog(self):
+        from tkcalendar import DateEntry
+        import datetime as _dt
+
+        window = ctk.CTkToplevel(self)
+        window.title("Contas a Pagar")
+        window.geometry("950x720")
+        window.attributes("-topmost", True)
+        window.grab_set()
+        window.focus_force()
+
+        # ===== BARRA DE NAVEGAÇÃO (sem CTkTabview) =====
+        nav_frame = ctk.CTkFrame(window, fg_color="transparent", height=40)
+        nav_frame.pack(fill="x", padx=15, pady=(10, 0))
+
+        frame_lista = ctk.CTkFrame(window, fg_color=("white", "#2B2B2B"))
+        frame_nova = ctk.CTkFrame(window, fg_color=("white", "#2B2B2B"))
+
+        def _mostrar_lista():
+            frame_nova.pack_forget()
+            frame_lista.pack(fill="both", expand=True, padx=15, pady=(5, 15))
+            btn_nav_lista.configure(fg_color="#0A4174")
+            btn_nav_nova.configure(fg_color="#555555")
+
+        def _mostrar_nova():
+            frame_lista.pack_forget()
+            frame_nova.pack(fill="both", expand=True, padx=15, pady=(5, 15))
+            btn_nav_nova.configure(fg_color="#0A4174")
+            btn_nav_lista.configure(fg_color="#555555")
+
+        btn_nav_lista = ctk.CTkButton(nav_frame, text="Contas", command=_mostrar_lista,
+                                       width=120, height=32, fg_color="#0A4174", hover_color="#062F56",
+                                       font=("Aileron", 12, "bold"))
+        btn_nav_lista.pack(side="left", padx=(0, 5))
+
+        btn_nav_nova = ctk.CTkButton(nav_frame, text="+ Nova Conta", command=_mostrar_nova,
+                                      width=140, height=32, fg_color="#555555", hover_color="#062F56",
+                                      font=("Aileron", 12, "bold"))
+        btn_nav_nova.pack(side="left", padx=5)
+
+        # ===== FRAME LISTA DE CONTAS =====
+        filtro_frame = ctk.CTkFrame(frame_lista, fg_color="transparent")
+        filtro_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        ctk.CTkLabel(filtro_frame, text="Filtro:", font=("Aileron", 11, "bold")).pack(side="left", padx=5)
+        filtro_var = ctk.StringVar(value="Pendente")
+        for txt in ["Pendente", "Pago", "Todos"]:
+            ctk.CTkRadioButton(filtro_frame, text=txt, variable=filtro_var, value=txt,
+                              font=("Aileron", 11), command=lambda: _refresh_contas()).pack(side="left", padx=8)
+
+        total_label = ctk.CTkLabel(filtro_frame, text="", font=("Aileron", 12, "bold"),
+                                   text_color=("#E65100", "#FF9800"))
+        total_label.pack(side="right", padx=15)
+
+        cols = ("id", "descricao", "valor", "vencimento", "fornecedor", "status", "parcela")
+        tree = ttk.Treeview(frame_lista, columns=cols, show="headings", height=18)
+        for c, h, w in [("id", "ID", 40), ("descricao", "Descrição", 200), ("valor", "Valor", 80),
+                        ("vencimento", "Vencimento", 100), ("fornecedor", "Fornecedor", 150),
+                        ("status", "Status", 80), ("parcela", "Parcela", 70)]:
+            tree.heading(c, text=h)
+            tree.column(c, width=w)
+        tree.pack(fill="both", expand=True, padx=10, pady=5)
+
+        btn_frame = ctk.CTkFrame(frame_lista, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=10, pady=10)
+
+        def _refresh_contas():
+            for i in tree.get_children():
+                tree.delete(i)
+            filtro = filtro_var.get()
+            status = filtro if filtro != "Todos" else None
+            df = self.db.listar_contas_pagar(status=status)
+            total_pend = 0
+            for _, row in df.iterrows():
+                parc_txt = f"{int(row.get('parcela_atual', 1))}/{int(row.get('total_parcelas', 1))}"
+                venc = str(row.get('data_vencimento', ''))
+                valor = row.get('valor', 0)
+                st = row.get('status', 'Pendente')
+                if st == 'Pendente':
+                    total_pend += valor
+                tree.insert("", "end", values=(
+                    row['id'], row.get('descricao', ''), f"R$ {valor:.2f}",
+                    venc, row.get('fornecedor_nome', ''), st, parc_txt
+                ))
+            total_label.configure(text=f"Total Pendente: R$ {total_pend:.2f}")
+
+        def _pagar_selecionada():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("Alerta", "Selecione uma conta.", parent=window)
+                return
+            conta_id = tree.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirmar", "Marcar esta conta como PAGA?", parent=window):
+                self.db.pagar_conta(conta_id)
+                _refresh_contas()
+                self.notifier.notify("Conta Paga", "Conta quitada com sucesso!", tipo="success")
+
+        def _cancelar_selecionada():
+            sel = tree.selection()
+            if not sel:
+                return
+            conta_id = tree.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirmar", "Cancelar esta conta?", parent=window):
+                self.db.cancelar_conta_pagar(conta_id)
+                _refresh_contas()
+
+        ctk.CTkButton(btn_frame, text="Pagar Selecionada", fg_color="#28a745", hover_color="#218838",
+                     text_color="white", font=("Aileron", 12, "bold"), height=38,
+                     command=_pagar_selecionada).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancelar Conta", fg_color="#dc3545", hover_color="#c82333",
+                     text_color="white", font=("Aileron", 12, "bold"), height=38,
+                     command=_cancelar_selecionada).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Atualizar", fg_color="#7BBDE8", hover_color="#49769F",
+                     text_color="#001D39", font=("Aileron", 12, "bold"), height=38,
+                     command=_refresh_contas).pack(side="right", padx=5)
+
+        _refresh_contas()
+
+        # ===== FRAME NOVA CONTA =====
+        form = ctk.CTkFrame(frame_nova, fg_color="transparent")
+        form.pack(padx=30, pady=20, fill="x")
+
+        ctk.CTkLabel(form, text="Nova Conta a Pagar", font=("Aileron", 18, "bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 15))
+
+        fields_frame = ctk.CTkFrame(form, fg_color="transparent")
+        fields_frame.pack(fill="x")
+        fields_frame.grid_columnconfigure(1, weight=1)
+
+        entries = {}
+
+        # Descrição
+        ctk.CTkLabel(fields_frame, text="Descrição:", font=("Aileron", 11)).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        entries["desc"] = ctk.CTkEntry(fields_frame, height=35)
+        entries["desc"].grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+
+        # Valor
+        ctk.CTkLabel(fields_frame, text="Valor (R$):", font=("Aileron", 11)).grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        entries["valor"] = ctk.CTkEntry(fields_frame, height=35)
+        entries["valor"].grid(row=1, column=1, sticky="ew", padx=5, pady=5)
+
+        # Vencimento com calendário
+        ctk.CTkLabel(fields_frame, text="Vencimento:", font=("Aileron", 11)).grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        venc_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
+        venc_frame.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
+        venc_frame.grid_columnconfigure(0, weight=1)
+
+        date_entry = DateEntry(venc_frame, width=20, background='#0A4174', foreground='white',
+                              borderwidth=2, date_pattern='yyyy-mm-dd', font=("Aileron", 11),
+                              mindate=_dt.date.today(), locale='pt_BR')
+        date_entry.grid(row=0, column=0, sticky="ew")
+
+        # Categoria
+        ctk.CTkLabel(fields_frame, text="Categoria:", font=("Aileron", 11)).grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        entries["cat"] = ctk.CTkEntry(fields_frame, height=35)
+        entries["cat"].grid(row=3, column=1, sticky="ew", padx=5, pady=5)
+        entries["cat"].insert(0, "Outro")
+
+        # Parcelas
+        ctk.CTkLabel(fields_frame, text="Parcelas:", font=("Aileron", 11)).grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        entries["parcelas"] = ctk.CTkEntry(fields_frame, height=35)
+        entries["parcelas"].grid(row=4, column=1, sticky="ew", padx=5, pady=5)
+        entries["parcelas"].insert(0, "1")
+
+        # Observação
+        ctk.CTkLabel(fields_frame, text="Observação:", font=("Aileron", 11)).grid(row=5, column=0, sticky="w", padx=5, pady=5)
+        entries["obs"] = ctk.CTkEntry(fields_frame, height=35)
+        entries["obs"].grid(row=5, column=1, sticky="ew", padx=5, pady=5)
+
+        # Fornecedor dropdown
+        ctk.CTkLabel(fields_frame, text="Fornecedor:", font=("Aileron", 11)).grid(row=6, column=0, sticky="w", padx=5, pady=5)
+        df_forn = self.db.listar_fornecedores()
+        forn_list = ["Nenhum"] + df_forn['nome'].tolist() if not df_forn.empty else ["Nenhum"]
+        forn_var = ctk.StringVar(value="Nenhum")
+        ctk.CTkOptionMenu(fields_frame, values=forn_list, variable=forn_var, height=35).grid(
+            row=6, column=1, sticky="ew", padx=5, pady=5)
+
+        def _salvar_conta():
+            desc = entries["desc"].get().strip()
+            try:
+                valor = float(entries["valor"].get().replace(",", "."))
+            except ValueError:
+                messagebox.showerror("Erro", "Valor inválido.", parent=window)
+                return
+            venc = date_entry.get_date().isoformat()
+            if not desc:
+                messagebox.showerror("Erro", "Preencha a descrição.", parent=window)
+                return
+            cat = entries["cat"].get().strip() or "Outro"
+            try:
+                parcelas = int(entries["parcelas"].get())
+            except ValueError:
+                parcelas = 1
+            obs = entries["obs"].get().strip()
+
+            forn_id = None
+            if forn_var.get() != "Nenhum" and not df_forn.empty:
+                forn_match = df_forn[df_forn['nome'] == forn_var.get()]
+                if not forn_match.empty:
+                    forn_id = int(forn_match.iloc[0]['id'])
+
+            self.db.adicionar_conta_pagar(desc, valor, venc, forn_id, cat, total_parcelas=parcelas, observacao=obs)
+            messagebox.showinfo("Sucesso", "Conta registrada!", parent=window)
+            entries["desc"].delete(0, "end")
+            entries["valor"].delete(0, "end")
+            entries["obs"].delete(0, "end")
+            entries["parcelas"].delete(0, "end")
+            entries["parcelas"].insert(0, "1")
+            entries["cat"].delete(0, "end")
+            entries["cat"].insert(0, "Outro")
+            _refresh_contas()
+            _mostrar_lista()
+
+        ctk.CTkButton(form, text="Salvar Conta", height=42, fg_color="#7BBDE8", hover_color="#49769F",
+                     text_color="#001D39", font=("Aileron", 13, "bold"),
+                     command=_salvar_conta).pack(pady=20, fill="x")
+
+        # Iniciar mostrando a lista
+        _mostrar_lista()
+
+    # ================================================================
+    # ============ ETIQUETAS ============
+    # ================================================================
+
+    def open_etiquetas_dialog(self):
+        import label_generator
+        window = ctk.CTkToplevel(self)
+        window.title("Gerador de Etiquetas")
+        window.geometry("700x600")
+        window.attributes("-topmost", True)
+        window.grab_set()
+        window.focus_set()
+
+        main_f = ctk.CTkFrame(window, fg_color="transparent")
+        main_f.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(main_f, text="Gerador de Etiquetas", font=("Aileron", 18, "bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 10))
+
+        if not label_generator.etiquetas_disponiveis():
+            ctk.CTkLabel(main_f, text="Bibliotecas de imagem não disponíveis.\nInstale: pip install pillow python-barcode qrcode",
+                        font=("Aileron", 12), text_color="red").pack(pady=30)
+            return
+
+        # Configurações
+        cfg_frame = ctk.CTkFrame(main_f, fg_color=("white", "#2B2B2B"), corner_radius=10)
+        cfg_frame.pack(fill="x", pady=(0, 10), padx=5)
+
+        ctk.CTkLabel(cfg_frame, text="Configurações:", font=("Aileron", 12, "bold")).pack(anchor="w", padx=15, pady=(10, 5))
+
+        opts_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        opts_frame.pack(fill="x", padx=15, pady=(0, 10))
+
+        var_preco = ctk.BooleanVar(value=True)
+        var_codigo = ctk.BooleanVar(value=True)
+        var_qr = ctk.BooleanVar(value=False)
+
+        ctk.CTkCheckBox(opts_frame, text="Mostrar preço", variable=var_preco, font=("Aileron", 11)).pack(side="left", padx=10)
+        ctk.CTkCheckBox(opts_frame, text="Código de barras", variable=var_codigo, font=("Aileron", 11)).pack(side="left", padx=10)
+        ctk.CTkCheckBox(opts_frame, text="QR Code", variable=var_qr, font=("Aileron", 11)).pack(side="left", padx=10)
+
+        # Lista de produtos
+        ctk.CTkLabel(main_f, text="Selecione produtos para gerar etiquetas:", font=("Aileron", 11)).pack(anchor="w", padx=5)
+
+        cols = ("sel", "id", "nome", "preco", "codigo")
+        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=12)
+        for c, h, w in [("sel", "☑", 30), ("id", "ID", 40), ("nome", "Produto", 250),
+                        ("preco", "Preço", 80), ("codigo", "Código", 150)]:
+            tree.heading(c, text=h)
+            tree.column(c, width=w)
+        tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Preencher lista
+        df = self.db.listar_produtos()
+        selected_ids = set()
+
+        def _toggle(event):
+            item = tree.identify_row(event.y)
+            if item:
+                pid = tree.item(item)['values'][1]
+                if pid in selected_ids:
+                    selected_ids.discard(pid)
+                    tree.item(item, values=("☐",) + tuple(tree.item(item)['values'][1:]))
+                else:
+                    selected_ids.add(pid)
+                    tree.item(item, values=("☑",) + tuple(tree.item(item)['values'][1:]))
+
+        tree.bind("<Button-1>", _toggle)
+
+        for _, row in df.iterrows():
+            tree.insert("", "end", values=("☐", row['id'], row['nome'],
+                        f"R$ {row['preco']:.2f}", row.get('codigo_barras', '')))
+
+        # Quantidade por etiqueta
+        qty_frame = ctk.CTkFrame(main_f, fg_color="transparent")
+        qty_frame.pack(fill="x", padx=5, pady=5)
+        ctk.CTkLabel(qty_frame, text="Cópias por produto:", font=("Aileron", 11)).pack(side="left")
+        e_qty = ctk.CTkEntry(qty_frame, width=60, height=32)
+        e_qty.insert(0, "1")
+        e_qty.pack(side="left", padx=5)
+
+        def _gerar():
+            if not selected_ids:
+                messagebox.showwarning("Alerta", "Selecione ao menos um produto.", parent=window)
+                return
+            try:
+                qty = int(e_qty.get())
+            except ValueError:
+                qty = 1
+
+            config_nota = self.db.get_config_nota()
+            cfg = {
+                'mostrar_preco': var_preco.get(),
+                'mostrar_codigo': var_codigo.get(),
+                'mostrar_qrcode': var_qr.get(),
+                'empresa_nome': config_nota.get('empresa_nome', ''),
+            }
+
+            gerados = 0
+            output_dir = os.path.join(os.path.expanduser("~"), "Documents", "EstokeAoCubo_Etiquetas")
+            for pid in selected_ids:
+                prod_row = df[df['id'] == pid]
+                if prod_row.empty:
+                    continue
+                prod = prod_row.iloc[0].to_dict()
+                for _ in range(qty):
+                    path = label_generator.gerar_etiqueta(prod, cfg, output_dir)
+                    if path:
+                        gerados += 1
+
+            if gerados > 0:
+                messagebox.showinfo("Sucesso", f"{gerados} etiqueta(s) gerada(s) em:\n{output_dir}", parent=window)
+                try:
+                    os.startfile(output_dir)
+                except Exception:
+                    pass
+            else:
+                messagebox.showerror("Erro", "Nenhuma etiqueta gerada.", parent=window)
+
+        ctk.CTkButton(main_f, text="Gerar Etiquetas", height=42, fg_color="#7BBDE8", hover_color="#49769F",
+                     text_color="#001D39", font=("Aileron", 13, "bold"),
+                     command=_gerar).pack(pady=10, fill="x", padx=5)
+
+    # ================================================================
+    # ============ DRE SIMPLIFICADO ============
+    # ================================================================
+
+    def open_dre_dialog(self):
+        window = ctk.CTkToplevel(self)
+        window.title("DRE - Demonstrativo de Resultado")
+        window.geometry("800x750")
+        window.attributes("-topmost", True)
+        window.grab_set()
+        window.focus_set()
+
+        main_f = ctk.CTkScrollableFrame(window, fg_color="transparent")
+        main_f.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(main_f, text="Demonstrativo de Resultado do Exercício",
+                    font=("Aileron", 20, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 5))
+
+        # Seletor de período
+        periodo_frame = ctk.CTkFrame(main_f, fg_color="transparent")
+        periodo_frame.pack(fill="x", pady=(0, 15))
+
+        periodo_var = ctk.StringVar(value="mes")
+        for txt, val in [("Mês Atual", "mes"), ("Trimestre", "trimestre"), ("Ano", "ano")]:
+            ctk.CTkRadioButton(periodo_frame, text=txt, variable=periodo_var, value=val,
+                              font=("Aileron", 11), command=lambda: _render_dre()).pack(side="left", padx=10)
+
+        dre_container = ctk.CTkFrame(main_f, fg_color=("white", "#2B2B2B"), corner_radius=15,
+                                     border_width=1, border_color=("#E6E6E6", "#444444"))
+        dre_container.pack(fill="x", padx=5, pady=5)
+
+        def _render_dre():
+            for w in dre_container.winfo_children():
+                w.destroy()
+
+            dre = self.db.gerar_dre(periodo_var.get())
+
+            periodo_label = {"mes": "Mês Atual", "trimestre": "Trimestre Atual", "ano": "Ano Atual"}.get(
+                dre["periodo"], "Período")
+            ctk.CTkLabel(dre_container, text=f"Período: {periodo_label} ({dre['inicio']} a {dre['fim']})",
+                        font=("Aileron", 11), text_color=("gray40", "gray70")).pack(anchor="w", padx=20, pady=(15, 10))
+
+            def _linha(parent, texto, valor, bold=False, color=None, indent=0):
+                f = ctk.CTkFrame(parent, fg_color="transparent")
+                f.pack(fill="x", padx=20 + indent, pady=2)
+                font = ("Aileron", 12, "bold") if bold else ("Aileron", 11)
+                tc = color or ("#001D39", "white")
+                ctk.CTkLabel(f, text=texto, font=font, text_color=tc).pack(side="left")
+                val_color = color or ("#001D39", "white")
+                if isinstance(valor, (int, float)):
+                    val_text = f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                    if valor < 0:
+                        val_color = "#dc3545"
+                else:
+                    val_text = str(valor)
+                ctk.CTkLabel(f, text=val_text, font=font, text_color=val_color).pack(side="right")
+
+            def _separador(parent):
+                ctk.CTkFrame(parent, fg_color=("#E0E0E0", "#444444"), height=1).pack(fill="x", padx=20, pady=6)
+
+            _linha(dre_container, "RECEITA BRUTA", dre["receita_bruta"], bold=True)
+            _linha(dre_container, "  Vendas de Produtos", dre["receita_vendas"], indent=15)
+            _linha(dre_container, "  Serviços Prestados", dre["receita_servicos"], indent=15)
+            _separador(dre_container)
+
+            _linha(dre_container, "(-) Deduções / Descontos", -dre["deducoes"])
+            _separador(dre_container)
+
+            _linha(dre_container, "RECEITA LÍQUIDA", dre["receita_liquida"], bold=True, color="#0D47A1")
+            _separador(dre_container)
+
+            _linha(dre_container, "(-) CMV (Custo das Mercadorias)", -dre["cmv"])
+            _linha(dre_container, "(-) Custo dos Serviços", -dre["custo_servicos"])
+            _separador(dre_container)
+
+            cor_lb = "#28a745" if dre["lucro_bruto"] >= 0 else "#dc3545"
+            _linha(dre_container, "LUCRO BRUTO", dre["lucro_bruto"], bold=True, color=cor_lb)
+            _linha(dre_container, f"  Margem Bruta: {dre['margem_bruta']:.1f}%", "", indent=15)
+            _separador(dre_container)
+
+            _linha(dre_container, "(-) Despesas Fixas", -dre["despesas_fixas"])
+            _linha(dre_container, "(-) Despesas Variáveis", -dre["despesas_variaveis"])
+            _separador(dre_container)
+
+            cor_ro = "#28a745" if dre["resultado_operacional"] >= 0 else "#dc3545"
+            _linha(dre_container, "RESULTADO OPERACIONAL", dre["resultado_operacional"], bold=True, color=cor_ro)
+            _separador(dre_container)
+
+            cor_rl = "#28a745" if dre["resultado_liquido"] >= 0 else "#dc3545"
+            _linha(dre_container, "RESULTADO LÍQUIDO", dre["resultado_liquido"], bold=True, color=cor_rl)
+            _linha(dre_container, f"  Margem Líquida: {dre['margem_liquida']:.1f}%", "", indent=15)
+
+            # Rodapé
+            ctk.CTkFrame(dre_container, fg_color="transparent", height=15).pack()
+
+        _render_dre()
+
+        # Botão para abrir Fluxo de Caixa
+        btn_frame = ctk.CTkFrame(main_f, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=5, pady=10)
+
+        ctk.CTkButton(btn_frame, text="Ver Fluxo de Caixa Futuro", height=40,
+                     fg_color="#2874A6", hover_color="#1B4F72", text_color="white",
+                     font=("Aileron", 12, "bold"),
+                     command=lambda: self.open_fluxo_caixa_dialog()).pack(side="left", padx=5)
+
+        ctk.CTkButton(btn_frame, text="Ver Comissões", height=40,
+                     fg_color="#5DADE2", hover_color="#3498DB", text_color="#001D39",
+                     font=("Aileron", 12, "bold"),
+                     command=lambda: self.open_comissoes_dialog()).pack(side="left", padx=5)
+
+    # ================================================================
+    # ============ FLUXO DE CAIXA FUTURO ============
+    # ================================================================
+
+    def open_fluxo_caixa_dialog(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Fluxo de Caixa Futuro")
+        window.geometry("900x650")
+        window.attributes("-topmost", True)
+        window.grab_set()
+        window.focus_set()
+
+        main_f = ctk.CTkFrame(window, fg_color="transparent")
+        main_f.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(main_f, text="Projeção de Fluxo de Caixa",
+                    font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 5))
+
+        # Período
+        periodo_frame = ctk.CTkFrame(main_f, fg_color="transparent")
+        periodo_frame.pack(fill="x", pady=(0, 10))
+
+        dias_var = ctk.StringVar(value="90")
+        ctk.CTkLabel(periodo_frame, text="Projetar:", font=("Aileron", 11)).pack(side="left", padx=5)
+        for txt, val in [("30 dias", "30"), ("60 dias", "60"), ("90 dias", "90")]:
+            ctk.CTkRadioButton(periodo_frame, text=txt, variable=dias_var, value=val,
+                              font=("Aileron", 11), command=lambda: _render_fluxo()).pack(side="left", padx=8)
+
+        # Saldo card
+        saldo_card = ctk.CTkFrame(main_f, fg_color=("#E3F2FD", "#1A2A3A"), corner_radius=12)
+        saldo_card.pack(fill="x", padx=5, pady=(0, 10))
+        saldo_label = ctk.CTkLabel(saldo_card, text="", font=("Aileron", 16, "bold"),
+                                   text_color=("#0D47A1", "#4da6ff"))
+        saldo_label.pack(pady=12)
+
+        # Tabela
+        cols = ("data", "tipo", "descricao", "valor", "saldo")
+        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=16)
+        for c, h, w in [("data", "Data", 100), ("tipo", "Tipo", 120), ("descricao", "Descrição", 280),
+                        ("valor", "Valor", 100), ("saldo", "Saldo Projetado", 120)]:
+            tree.heading(c, text=h)
+            tree.column(c, width=w)
+        tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        def _render_fluxo():
+            for i in tree.get_children():
+                tree.delete(i)
+            dias = int(dias_var.get())
+            dados = self.db.projetar_fluxo_caixa(dias)
+            saldo_label.configure(
+                text=f"Saldo Atual: R$ {dados['saldo_atual']:,.2f}  |  "
+                     f"Média Diária Vendas: R$ {dados['media_diaria_vendas']:,.2f}")
+
+            tipo_labels = {
+                "saida": "Conta a Pagar", "saida_fixa": "Gasto Fixo",
+                "entrada": "Recebível", "projecao_vendas": "Projeção Vendas"
+            }
+
+            for item in dados["projecao"]:
+                valor = item["valor"]
+                saldo = item["saldo_acumulado"]
+                tree.insert("", "end", values=(
+                    item["data"], tipo_labels.get(item["tipo"], item["tipo"]),
+                    item["descricao"],
+                    f"R$ {valor:+,.2f}",
+                    f"R$ {saldo:,.2f}"
+                ))
+
+        _render_fluxo()
+
+    # ================================================================
+    # ============ CONTROLE DE COMISSÕES ============
+    # ================================================================
+
+    def open_comissoes_dialog(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Controle de Comissões")
+        window.geometry("800x550")
+        window.attributes("-topmost", True)
+        window.grab_set()
+        window.focus_set()
+
+        main_f = ctk.CTkFrame(window, fg_color="transparent")
+        main_f.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(main_f, text="Relatório de Comissões", font=("Aileron", 18, "bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 10))
+
+        # Período
+        periodo_frame = ctk.CTkFrame(main_f, fg_color="transparent")
+        periodo_frame.pack(fill="x", pady=(0, 10))
+
+        periodo_var = ctk.StringVar(value="mes")
+        for txt, val in [("Semana", "semana"), ("Mês", "mes"), ("Ano", "ano")]:
+            ctk.CTkRadioButton(periodo_frame, text=txt, variable=periodo_var, value=val,
+                              font=("Aileron", 11), command=lambda: _render_comissoes()).pack(side="left", padx=10)
+
+        total_label = ctk.CTkLabel(main_f, text="", font=("Aileron", 14, "bold"),
+                                   text_color=("#E65100", "#FF9800"))
+        total_label.pack(pady=5)
+
+        cols = ("vendedor", "taxa", "vendas", "faturamento", "lucro", "comissao")
+        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=12)
+        for c, h, w in [("vendedor", "Vendedor", 150), ("taxa", "Taxa %", 70), ("vendas", "Nº Vendas", 80),
+                        ("faturamento", "Faturamento", 120), ("lucro", "Lucro", 100), ("comissao", "Comissão", 100)]:
+            tree.heading(c, text=h)
+            tree.column(c, width=w)
+        tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        def _render_comissoes():
+            for i in tree.get_children():
+                tree.delete(i)
+            dados = self.db.calcular_comissoes(periodo_var.get())
+            df = dados["vendas"]
+            total_com = 0
+            for _, row in df.iterrows():
+                com = row.get('comissao_vendas', 0) or 0
+                total_com += com
+                tree.insert("", "end", values=(
+                    row.get('vendedor', ''),
+                    f"{row.get('taxa_comissao', 0):.1f}%",
+                    int(row.get('num_vendas', 0)),
+                    f"R$ {row.get('faturamento', 0):,.2f}",
+                    f"R$ {row.get('lucro', 0):,.2f}",
+                    f"R$ {com:,.2f}",
+                ))
+            total_label.configure(text=f"Total Comissões a Pagar: R$ {total_com:,.2f}")
+
+        _render_comissoes()
+
+    # ================================================================
+    # ============ GESTÃO DE LOJAS (Múltiplas Filiais) ============
+    # ================================================================
+
+    def open_lojas_dialog(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Gestão de Lojas/Filiais")
+        window.geometry("650x500")
+        window.attributes("-topmost", True)
+        window.grab_set()
+        window.focus_set()
+
+        main_f = ctk.CTkFrame(window, fg_color="transparent")
+        main_f.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(main_f, text="Lojas / Filiais", font=("Aileron", 18, "bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 10))
+
+        # Lista
+        cols = ("id", "nome", "endereco", "telefone", "cnpj")
+        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=10)
+        for c, h, w in [("id", "ID", 40), ("nome", "Nome", 180), ("endereco", "Endereço", 200),
+                        ("telefone", "Telefone", 120), ("cnpj", "CNPJ", 140)]:
+            tree.heading(c, text=h)
+            tree.column(c, width=w)
+        tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        def _refresh():
+            for i in tree.get_children():
+                tree.delete(i)
+            df = self.db.listar_lojas()
+            for _, row in df.iterrows():
+                tree.insert("", "end", values=(row['id'], row['nome'], row.get('endereco', ''),
+                            row.get('telefone', ''), row.get('cnpj', '')))
+
+        # Form nova loja
+        form = ctk.CTkFrame(main_f, fg_color=("white", "#2B2B2B"), corner_radius=10)
+        form.pack(fill="x", padx=5, pady=10)
+
+        entries = {}
+        row_f = ctk.CTkFrame(form, fg_color="transparent")
+        row_f.pack(fill="x", padx=15, pady=10)
+
+        for i, (label, key, w) in enumerate([("Nome", "nome", 150), ("Endereço", "end", 180),
+                                              ("Telefone", "tel", 100), ("CNPJ", "cnpj", 130)]):
+            ctk.CTkLabel(row_f, text=label + ":", font=("Aileron", 10)).grid(row=0, column=i*2, padx=2)
+            e = ctk.CTkEntry(row_f, width=w, height=32)
+            e.grid(row=0, column=i*2+1, padx=2)
+            entries[key] = e
+
+        btn_f = ctk.CTkFrame(form, fg_color="transparent")
+        btn_f.pack(fill="x", padx=15, pady=(0, 10))
+
+        def _add():
+            nome = entries["nome"].get().strip()
+            if not nome:
+                messagebox.showerror("Erro", "Nome obrigatório.", parent=window)
+                return
+            self.db.adicionar_loja(nome, entries["end"].get().strip(),
+                                   entries["tel"].get().strip(), entries["cnpj"].get().strip())
+            for e in entries.values():
+                e.delete(0, "end")
+            _refresh()
+
+        def _remove():
+            sel = tree.selection()
+            if not sel:
+                return
+            lid = tree.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirmar", "Desativar esta loja?", parent=window):
+                self.db.remover_loja(lid)
+                _refresh()
+
+        ctk.CTkButton(btn_f, text="Adicionar", fg_color="#28a745", hover_color="#218838",
+                     text_color="white", font=("Aileron", 11, "bold"), height=32,
+                     command=_add).pack(side="left", padx=5)
+        ctk.CTkButton(btn_f, text="Remover", fg_color="#dc3545", hover_color="#c82333",
+                     text_color="white", font=("Aileron", 11, "bold"), height=32,
+                     command=_remove).pack(side="left", padx=5)
+
+        _refresh()
+
+    # ================================================================
+    # ============ GESTÃO DE USUÁRIOS ============
+    # ================================================================
+
+    def open_usuarios_dialog(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Gestão de Usuários")
+        window.geometry("800x600")
+        window.attributes("-topmost", True)
+        window.grab_set()
+        window.focus_set()
+
+        tabview = ctk.CTkTabview(window, fg_color=("white", "#2B2B2B"))
+        tabview.pack(fill="both", expand=True, padx=15, pady=15)
+
+        tab_lista = tabview.add("Usuários")
+        tab_novo = tabview.add("Novo Usuário")
+
+        # ===== ABA LISTA =====
+        cols = ("id", "nome", "login", "perfil", "ativo", "loja")
+        tree = ttk.Treeview(tab_lista, columns=cols, show="headings", height=15)
+        for c, h, w in [("id", "ID", 40), ("nome", "Nome", 180), ("login", "Login", 120),
+                        ("perfil", "Perfil", 100), ("ativo", "Ativo", 60), ("loja", "Loja", 80)]:
+            tree.heading(c, text=h)
+            tree.column(c, width=w)
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        def _refresh():
+            for i in tree.get_children():
+                tree.delete(i)
+            df = self.db.listar_usuarios()
+            for _, row in df.iterrows():
+                tree.insert("", "end", values=(
+                    row['id'], row['nome'], row['login'], row['perfil'],
+                    "Sim" if row['ativo'] else "Não", row.get('loja_id', '') or '-'
+                ))
+
+        btn_frame = ctk.CTkFrame(tab_lista, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=10, pady=10)
+
+        def _desativar():
+            sel = tree.selection()
+            if not sel:
+                return
+            uid = tree.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirmar", "Desativar este usuário?", parent=window):
+                self.db.remover_usuario(uid)
+                _refresh()
+
+        def _alterar_senha():
+            sel = tree.selection()
+            if not sel:
+                return
+            uid = tree.item(sel[0])['values'][0]
+            nome = tree.item(sel[0])['values'][1]
+
+            dlg = ctk.CTkToplevel(window)
+            dlg.title(f"Alterar Senha - {nome}")
+            dlg.geometry("350x200")
+            dlg.attributes("-topmost", True)
+            dlg.grab_set()
+
+            ctk.CTkLabel(dlg, text="Nova Senha:", font=("Aileron", 12)).pack(padx=20, pady=(20, 5))
+            e_pw = ctk.CTkEntry(dlg, show="*", height=35)
+            e_pw.pack(padx=20, fill="x")
+
+            def _save():
+                pw = e_pw.get().strip()
+                if len(pw) < 4:
+                    messagebox.showerror("Erro", "Senha deve ter 4+ caracteres.", parent=dlg)
+                    return
+                self.db.alterar_senha_usuario(uid, pw)
+                messagebox.showinfo("Sucesso", "Senha alterada!", parent=dlg)
+                dlg.destroy()
+
+            ctk.CTkButton(dlg, text="Salvar", height=38, fg_color="#7BBDE8", hover_color="#49769F",
+                         command=_save).pack(padx=20, pady=20, fill="x")
+
+        ctk.CTkButton(btn_frame, text="Desativar", fg_color="#dc3545", hover_color="#c82333",
+                     text_color="white", font=("Aileron", 11, "bold"), height=35,
+                     command=_desativar).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Alterar Senha", fg_color="#5DADE2", hover_color="#3498DB",
+                     text_color="#001D39", font=("Aileron", 11, "bold"), height=35,
+                     command=_alterar_senha).pack(side="left", padx=5)
+
+        _refresh()
+
+        # ===== ABA NOVO USUÁRIO =====
+        form = ctk.CTkFrame(tab_novo, fg_color="transparent")
+        form.pack(padx=30, pady=20, fill="both", expand=True)
+
+        ctk.CTkLabel(form, text="Cadastrar Novo Usuário", font=("Aileron", 18, "bold"),
+                    text_color=("#001D39", "white")).pack(pady=(0, 15))
+
+        fields_frame = ctk.CTkFrame(form, fg_color="transparent")
+        fields_frame.pack(fill="x")
+        fields_frame.grid_columnconfigure(1, weight=1)
+
+        entries_u = {}
+        for i, (label, key) in enumerate([("Nome Completo", "nome"), ("Login", "login"), ("Senha", "senha")]):
+            ctk.CTkLabel(fields_frame, text=label + ":", font=("Aileron", 11)).grid(row=i, column=0, sticky="w", padx=5, pady=8)
+            show = "*" if key == "senha" else ""
+            e = ctk.CTkEntry(fields_frame, height=35, show=show)
+            e.grid(row=i, column=1, sticky="ew", padx=5, pady=8)
+            entries_u[key] = e
+
+        # Perfil
+        ctk.CTkLabel(fields_frame, text="Perfil:", font=("Aileron", 11)).grid(row=3, column=0, sticky="w", padx=5, pady=8)
+        perfil_var = ctk.StringVar(value="vendedor")
+        ctk.CTkOptionMenu(fields_frame, values=["admin", "gerente", "vendedor", "caixa"],
+                          variable=perfil_var, height=35).grid(row=3, column=1, sticky="ew", padx=5, pady=8)
+
+        # Loja
+        ctk.CTkLabel(fields_frame, text="Loja:", font=("Aileron", 11)).grid(row=4, column=0, sticky="w", padx=5, pady=8)
+        df_lojas = self.db.listar_lojas()
+        loja_nomes = ["Todas"] + df_lojas['nome'].tolist() if not df_lojas.empty else ["Todas"]
+        loja_var = ctk.StringVar(value="Todas")
+        ctk.CTkOptionMenu(fields_frame, values=loja_nomes, variable=loja_var, height=35).grid(
+            row=4, column=1, sticky="ew", padx=5, pady=8)
+
+        # Tabela de permissões
+        perm_frame = ctk.CTkFrame(form, fg_color=("white", "#2B2B2B"), corner_radius=10)
+        perm_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(perm_frame, text="Permissões por Perfil:", font=("Aileron", 11, "bold")).pack(padx=15, pady=(10, 5), anchor="w")
+
+        perm_text = (
+            "Admin: Acesso total\n"
+            "Gerente: Relatórios, configurações, vendas, estoque, financeiro\n"
+            "Vendedor: Vendas, produtos, clientes, kits, etiquetas, chat IA\n"
+            "Caixa: Vendas, caixa, clientes"
+        )
+        ctk.CTkLabel(perm_frame, text=perm_text, font=("Aileron", 10),
+                    text_color=("gray40", "gray70"), justify="left").pack(padx=15, pady=(0, 10), anchor="w")
+
+        def _criar_usuario():
+            nome = entries_u["nome"].get().strip()
+            login = entries_u["login"].get().strip()
+            senha = entries_u["senha"].get().strip()
+            if not nome or not login or not senha:
+                messagebox.showerror("Erro", "Preencha todos os campos.", parent=window)
+                return
+            if len(senha) < 4:
+                messagebox.showerror("Erro", "Senha deve ter 4+ caracteres.", parent=window)
+                return
+            perfil = perfil_var.get()
+
+            loja_id = None
+            if loja_var.get() != "Todas" and not df_lojas.empty:
+                match = df_lojas[df_lojas['nome'] == loja_var.get()]
+                if not match.empty:
+                    loja_id = int(match.iloc[0]['id'])
+
+            ok, msg = self.db.adicionar_usuario(nome, login, senha, perfil, loja_id)
+            if ok:
+                messagebox.showinfo("Sucesso", msg, parent=window)
+                for e in entries_u.values():
+                    e.delete(0, "end")
+                _refresh()
+            else:
+                messagebox.showerror("Erro", msg, parent=window)
+
+        ctk.CTkButton(form, text="Criar Usuário", height=42, fg_color="#7BBDE8", hover_color="#49769F",
+                     text_color="#001D39", font=("Aileron", 13, "bold"),
+                     command=_criar_usuario).pack(pady=10, fill="x")
+
+
+if __name__ == '__main__':
+    import atexit
+    app = App()
+    
+    def fechar_banco_atexit():
+        try:
+            app.db.close()
+        except Exception:
+            pass
+
+    atexit.register(fechar_banco_atexit)
+    
+    try:
+        app.mainloop()
+    finally:
+        # Garantir fechamento do banco de dados
+        fechar_banco_atexit()
+        logger.info("Aplicação encerrada.")

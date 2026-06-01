@@ -1,0 +1,28 @@
+customtkinter
+matplotlib
+pandas
+scikit-learn
+numpy
+pillow
+google-generativeai
+python-dotenv
+pdfplumber
+
+# libs para comunicação com impressoras fiscais
+python-escpos
+pyserial
+pywin32
+
+# leitor de código de barras via webcam
+opencv-python
+pyzbar
+
+# etiquetas e código de barras
+python-barcode
+qrcode
+
+# API REST para app mobile
+flask
+
+# criptografia do banco de dados
+cryptography

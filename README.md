@@ -1,3 +1,61 @@
+# EstokeAoCubo — Open-Source Smart ERP & POS for Small Businesses
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/brianxavier18/estoke-ao-cubo/actions/workflows/ci.yml/badge.svg)](https://github.com/brianxavier18/estoke-ao-cubo/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Version](https://img.shields.io/badge/Version-4.3.0-0ea5e9.svg)](#)
+[![Website](https://img.shields.io/badge/Website-estoke--ao--cubo.pages.dev-10367D?logo=google-chrome&logoColor=white)](https://estoke-ao-cubo.pages.dev)
+
+> **Português:** [Documentação completa em Português abaixo](#estokeaocubo---sistema-de-gestão-inteligente).
+
+## About & Social Purpose
+
+**EstokeAoCubo** is a free, open-source, offline-first desktop ERP and Point of Sale (POS) built to empower **micro-entrepreneurs, local shops, restaurants, repair workshops, and independent artisans** in Brazil and Latin America who cannot afford expensive SaaS subscriptions or rely on unstable internet connections.
+
+It runs locally with **zero mandatory cloud fees**, encrypts local SQLite data at rest (Fernet AES-128 + Windows DPAPI), supports ESC/POS thermal receipt printers, and includes an optional embedded Flask REST API for mobile companion apps.
+
+## Core Features
+
+- **Inventory & Virtual Kits:** Product tracking, batch/serial/IMEI traceability, expiry alerts, CSV/PDF bulk import, and atomic stock deduction for virtual bundles.
+- **Point of Sale (POS) & Restaurant Mode:** Cash/PIX/card/store-credit checkout, change calculator, table map, kitchen Kanban board, bill splitting, and direct ESC/POS thermal printing.
+- **Financial Management & Analytics:** Real profit calculation, simplified income statement (DRE), 90-day cash flow projection, ABC (Pareto) analysis, accounts payable/receivable, and sales commissions.
+- **Work Orders (OS) & Multi-Store RBAC:** 7-stage service order workflow, multi-branch support, and role-based access control (`Admin`, `Manager`, `Seller`, `Cashier`).
+- **Hardware & AI Integrations:** Webcam barcode/QR scanner (`OpenCV` + `pyzbar`), barcode label generator, local linear-regression expense forecasting, optional Gemini AI assistant, and embedded Flask REST API (port `5050`).
+
+## Quick Start (Run Locally)
+
+### Prerequisites
+- Python `3.10+`
+- `pip` (virtual environment recommended)
+
+### Installation & Run
+```bash
+git clone https://github.com/brianxavier18/estoke-ao-cubo.git
+cd estoke-ao-cubo
+
+python -m venv .venv
+# Windows PowerShell:
+.venv\Scripts\Activate.ps1
+# Linux / macOS:
+# source .venv/bin/activate
+
+pip install -r requirements.txt
+cp .env.example .env   # Optional: configure Gemini / Mercado Pago keys
+python main.py
+```
+
+### Running Tests
+```bash
+pytest
+```
+
+## Contributing & License
+
+Contributions, bug reports, and translations are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+Licensed under the **MIT License** — see [LICENSE](LICENSE) for details.
+
+---
+
 # EstokeAoCubo - Sistema de Gestão Inteligente
 
 [![Website](https://img.shields.io/badge/Website-EstokeAoCubo-blue?style=for-the-badge&logo=google-chrome)](https://estoke-ao-cubo.pages.dev)
@@ -85,7 +143,7 @@ Acesse nosso site oficial para download e mais informações: **[estoke-ao-cubo.
 -   **Painel da Cozinha**: Kanban com 3 colunas (Recebido → Preparando → Pronto). Auto-refresh a cada 15s. Ideal para monitor dedicado na cozinha.
 -   **Fichas Técnicas**: Integração com módulos INSUMOS e PRODUÇÃO para controle de ingredientes por receita.
 
-### � Ordem de Serviço (OS) [NOVO v4.2]
+### 🔧 Ordem de Serviço (OS) [NOVO v4.2]
 -   **Workflow de 7 Etapas**: Recebido → Em Análise → Aguardando Peça → Em Execução → Pronto → Entregue → Concluído.
 -   **Campo Equipamento/Item**: Identifique o que está sendo consertado (ex: "iPhone 14", "Notebook Dell").
 -   **Histórico Colorido**: Cards com badges de status e bordas coloridas por etapa.
@@ -97,7 +155,7 @@ Acesse nosso site oficial para download e mais informações: **[estoke-ao-cubo.
 -   **Logo Otimizado**: Altura máxima 80px (antes 130px), largura máxima 300px para ESC/POS.
 -   **Pré-visualização**: Botão "👁 Pré-visualizar Nota" nas Configurações > Nota/Recibo gera exemplo visual antes de imprimir.
 
-### �👤 Multi-Usuário & Permissões [NOVO v4.0]
+### 👤 Multi-Usuário & Permissões [NOVO v4.0]
 -   **Perfis de Acesso**: 4 perfis pré-definidos — Administrador (acesso total), Gerente (sem gestão de usuários), Vendedor (vendas e cadastros), Caixa (vendas e caixa).
 -   **Gestão de Usuários**: Cadastro com login, senha (SHA-256), perfil e vinculação a loja. Ativar/desativar sem excluir.
 -   **Controle de Permissões**: Cada funcionalidade verifica o perfil do usuário logado antes de permitir acesso.
@@ -440,13 +498,3 @@ A tabela `estabelecimento` armazena:
 - `prioridade`: Baixa, Média ou Alta
 - `data_criacao`: Timestamp da criação
 
----
-
-## ❌ Removido: Scanner Mobile e QR Code
-
-A partir da versão 2.1 (10/01/2026), o sistema **NÃO possui mais integração com scanner mobile, QR Code, servidor local, túnel ou qualquer função de leitura via celular**.
-
-- O cadastro e leitura de produtos agora é feito **exclusivamente pelo leitor de código de barras físico** (USB ou integrado ao PC).
-- Toda a lógica, dependências e arquivos relacionados a QR Code, scanner mobile, servidor local e túnel foram removidos para simplificar o uso e evitar problemas de rede.
-
----
